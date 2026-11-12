@@ -225,7 +225,7 @@ to `~/.muse-ai-local-bridge/audit.log`:
 ## 10. V2 (fork, additive — V1 tools and endpoints are unchanged)
 
 V2 keeps every V1 tool, endpoint and error code, and adds the tools below.
-`/api/tools/list` now also returns `version: "0.3.0"`, `shell_enabled`
+`/api/tools/list` now also returns `version: "0.3.1"`, `shell_enabled`
 and `git_write_enabled`, so a client can tell at a glance what is on.
 
 ### 10.1 Persistent terminals (requires `--allow-shell`)
@@ -316,7 +316,7 @@ All other V1 codes are unchanged.
 
 ## 11. V3 (fork, additive — V1/V2 tools and endpoints are unchanged)
 
-`/api/tools/list` now returns `version: "0.3.0"`. Tool names, response
+`/api/tools/list` now returns `version: "0.3.1"`. Tool names, response
 shapes and error envelopes are unchanged. What changed is under the hood:
 
 - **Central Gate (`lib/gate.js`, fail-closed).** One module validates
@@ -359,3 +359,24 @@ PTY support, sandboxing (`bwrap`) and streaming (SSE/NDJSON) are
 **DEFERRED** — see README "V3 — deferred (P2)" for the reasons. They
 need an optional native dependency / Linux-only tooling / a new
 transport, and none of them may break the zero-dependency default.
+
+## 12. v0.3.1 — ready-to-code mode (CLI only, no tool/protocol change)
+
+`/api/tools/list` now returns `version: "0.3.1"`. Tool names, response
+shapes, error envelopes, Gate, token and root scope are unchanged.
+Only the operator-side CLI got shorter:
+
+- `mbridge code [folder] [options]` — exactly `--allow-shell` +
+  `--allow-git-write`, scoped to `[folder]` (or the current folder).
+  The folder goes through the same root guards (must exist, must not
+  be home/drive root). `--read-only` still wins if given together.
+  The server prints a warning banner at startup in this mode.
+- `mbridge setup` — one-time: merges `allow_shell` + `allow_git_write`
+  = `true` into `~/.muse-ai-local-bridge/config.json` (existing roots
+  and other keys kept, token file untouched). Idempotent. It also
+  reports whether `cloudflared` is installed and prints the matching
+  tunnel command; it never installs anything. After `setup`, plain
+  `mbridge` is already ready-to-code mode, because the server already
+  read those two flags from `config.json` since v2.
+- Plain `mbridge` without `setup`/`code` stays allowlist-only — the
+  default was not changed. A tool call can never enable shell/git-write.

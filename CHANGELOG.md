@@ -1,5 +1,26 @@
 # Changelog — muse-ai-local-bridge (fork)
 
+## v0.3.1 — 12 Nov 2026 (code + tests; NOT pushed/tagged/released)
+
+Ease of use only — no change to the v0.3.0 security core (Gate, token,
+root scope, audit) and no tool/protocol change.
+
+- **`mbridge code [folder]`** — ready-to-code mode in one word: exactly
+  `--allow-shell --allow-git-write`, scoped to `[folder]` (or cwd),
+  same root guards, warning banner at startup. `--read-only` still wins.
+- **`mbridge setup`** — one-time: merges `allow_shell` +
+  `allow_git_write` = `true` into `~/.muse-ai-local-bridge/config.json`
+  (roots and other keys kept, token untouched, idempotent). Also reports
+  whether `cloudflared` is installed and prints the tunnel command;
+  it never installs anything. After `setup`, plain `mbridge` is already
+  ready-to-code mode (the server has read those flags from config.json
+  since v2 — verified in `server.js`).
+- **Plain `mbridge` without `setup`/`code` stays allowlist-only** —
+  the default was NOT changed silently; the trade-off is documented in
+  README + SECURITY.md.
+- README Quick start is now 3 steps (clone+install, `mbridge setup`,
+  `cd project && mbridge code`); PROTOCOL.md §12 documents the CLI.
+
 ## v0.3.0 — 12 Nov 2026 (code + tests; NOT pushed/tagged/released)
 
 V3: same 27 tools, same response shapes — hardened + faster.

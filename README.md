@@ -1,6 +1,6 @@
 # muse-ai-local-bridge — V3 fork
 
-> **Fork note:** this is an unofficial fork (v0.3.0) of
+> **Fork note:** this is an unofficial fork (v0.3.1) of
 > [tegarp00/muse-ai-local-bridge](https://github.com/tegarp00/muse-ai-local-bridge)
 > (MIT, v0.1.0). The original MIT license is unchanged (`LICENSE`).
 > V1 behaviour is preserved — every V1 tool works exactly as before.
@@ -20,38 +20,45 @@ inside the folder you chose, never outside it.
 
 Zero runtime dependencies. One file you can audit in ten minutes.
 
-## Quick start
+## Quick start — 3 steps
 
-1. **Install Node.js 18+.** Nothing else.
-2. **Install the bridge** (or run it once with `npx muse-ai-local-bridge`):
+1. **Install (once).** Node.js 18+ and the bridge:
    ```sh
-   npm install -g muse-ai-local-bridge
+   git clone https://github.com/fahmi0812/muse-ai-local-bridge.git
+   cd muse-ai-local-bridge
+   npm install -g .
    ```
-3. **Run the server inside your project folder:**
+2. **Set up ready-to-code mode (once).**
    ```sh
-   cd ~/projects/my-project
-   mbridge
+   mbridge setup
    ```
-   It prints your access token. Keep that terminal open.
-3. **Expose it** with a tunnel you control. Any tunnel works — cloudflared,
-   ngrok, Tailscale, … — e.g.:
+   This saves `allow_shell` + `allow_git_write` = `true` in
+   `~/.muse-ai-local-bridge/config.json` (existing project roots are
+   kept, the token file is untouched). Run it twice and nothing changes.
+3. **Start coding.** In your project folder:
    ```sh
-   cloudflared tunnel --url http://localhost:8787
+   cd ~/projects/my-project && mbridge code
    ```
-   Note the public URL it gives you. (Quick tunnels are fine for trying;
-   for daily use set up a named tunnel — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md).)
-4. **In chat, paste:**
-   > connect to my local bridge at https://your-tunnel-url
-5. The assistant reads the skill from your URL, asks for the token through a
-   secure card (never paste the token as plain chat text), verifies, and
-   reports the mode and project roots it can see. You only paste the sentence
-   and enter the token — no explaining needed.
-6. **Done.** Ask it to read, search, edit, or run your build. Writes and commands
-   always ask for your approval first.
+   Keep that terminal open. Then publish it with a tunnel you control
+   (e.g. `cloudflared tunnel --url http://localhost:8787`), and in chat
+   paste `connect to my local bridge at <your-tunnel-url>`. The assistant
+   asks for the token through a secure card (never paste the token as
+   plain chat text), verifies, and reports the mode and project roots.
+   Done — ask it to read, search, edit, or run your build. Writes and
+   commands always ask for your approval first.
+
+   After step 2, plain `mbridge` (no flags, no `code`) is already
+   ready-to-code mode too. `mbridge code <folder>` works from anywhere
+   and scopes the server to that folder. The old explicit form still
+   works: `mbridge --allow-shell --allow-git-write`.
 
 ## CLI
 
 ```sh
+mbridge code [folder] [options]   ready-to-code mode (shell + git write on)
+mbridge setup                     one-time: save ready-to-code mode in config
+mbridge [options]                 plain server (allowlist-only, unless setup)
+
 npx muse-ai-local-bridge [options]
 
   --port <n>       listen port (default 8787)
@@ -90,7 +97,8 @@ Stuck? [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
 
 V1 stays the default: allowlist-only `run_command`, no shell. V2 adds
 power, but only when *you* turn it on at startup — a tool call can
-never enable it.
+never enable it. The easy way is `mbridge code` or a one-time
+`mbridge setup` (see Quick start); the explicit flags still work:
 
 ```sh
 cd ~/projects/my-project
@@ -99,6 +107,16 @@ mbridge --allow-shell --allow-git-write
 # Or via env / config.json (see config.example.json):
 #   MUSE_BRIDGE_ALLOW_SHELL=1 MUSE_BRIDGE_ALLOW_GIT_WRITE=1 mbridge
 ```
+
+**Trade-off (why this is opt-in, not the silent default):** `code` /
+`setup` only change *how you start the server* — they do not weaken
+the Gate, the token, the root scope, or the audit log, and
+`--read-only` still wins over both. But a full shell in the project
+folder *can* read `.env` and run anything there, so the mode is only
+ever switched on by an explicit operator action (`code`, `setup`, or
+the flags) and the server prints a warning banner at startup. Plain
+`mbridge` without `setup`/`code` stays allowlist-only. Details in
+[SECURITY.md](SECURITY.md).
 
 New tools (all in `/api/tools/list` when enabled):
 

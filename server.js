@@ -61,6 +61,8 @@ function printHelp() {
 
 Usage: server.js [options]
        server.js add <folder> | remove <name-or-path> | list
+       server.js code [folder] [options]   ready-to-code mode (see below)
+       server.js setup                     one-time: save ready-to-code mode
 
   --port N          listen port (default 8787)
   --read-only       read-only mode: write tools and run_command
@@ -85,7 +87,21 @@ Usage: server.js [options]
 
 The working directory where this command runs becomes the single access
 root. The server refuses to start in a drive root or your home directory.
-Listens on 127.0.0.1 only — publish it with your own tunnel.`);
+Listens on 127.0.0.1 only — publish it with your own tunnel.
+
+Ready-to-code mode (explicit opt-in, never the silent default):
+  code [folder]   same as --allow-shell --allow-git-write, scoped to
+                  [folder] (or the current folder). --read-only still
+                  wins if given together. Prints a warning at startup:
+                  full shell in this folder — use a private tunnel.
+  setup           one-time: writes allow_shell + allow_git_write = true
+                  into ~/.muse-ai-local-bridge/config.json (existing
+                  roots are kept, the token file is untouched). After
+                  that, plain 'mbridge' is already ready-to-code mode.
+                  Run it twice and nothing changes (idempotent).
+Plain 'mbridge' without setup or 'code' stays allowlist-only, exactly
+as in v3.0 — shell/git-write are only ever enabled by an explicit
+operator action, never by a tool call.`);
 }
 
 function parseArgs(argv) {
@@ -238,6 +254,62 @@ function cmdList() {
   console.log('\n* = default project');
 }
 
+// ---------------------------------------------------------------------------
+// `mbridge setup` — one-time opt-in to ready-to-code mode.
+//
+// Writes allow_shell + allow_git_write = true into
+// ~/.muse-ai-local-bridge/config.json, merging with whatever is already
+// there (existing roots and any other keys are kept; the token file is
+// never touched). Idempotent: running it twice writes the same content.
+// It never installs anything and never starts a server.
+// ---------------------------------------------------------------------------
+
+function cmdSetup() {
+  // Read the raw config so unknown/existing keys survive the merge.
+  // (readConfigFile() only keeps `roots` — too lossy for a merge.)
+  let cfg = {};
+  try {
+    const raw = JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    if (raw && typeof raw === 'object' && !Array.isArray(raw)) cfg = raw;
+  } catch { /* missing or broken: start from an empty object */ }
+  const already = cfg.allow_shell === true && cfg.allow_git_write === true;
+  const rootsCount = Array.isArray(cfg.roots) ? cfg.roots.length : 0;
+  if (!already) {
+    cfg.allow_shell = true;
+    cfg.allow_git_write = true;
+    writeConfigFile(cfg);
+  }
+  console.log(already ? 'already set up: ready-to-code mode was already on.' : 'setup done: ready-to-code mode is now on.');
+  console.log(`  config: ${CONFIG_PATH}`);
+  console.log('  wrote : allow_shell = true, allow_git_write = true');
+  console.log(`  kept  : ${rootsCount} project root(s) in config (unchanged); token file untouched.`);
+  // Tunnel check: report only, never auto-install anything.
+  let hasCloudflared = false;
+  try { hasCloudflared = spawnSync('which', ['cloudflared'], { encoding: 'utf8' }).status === 0; } catch { /* which missing: treat as absent */ }
+  console.log('');
+  if (hasCloudflared) {
+    console.log('  cloudflared: found. Next steps:');
+    console.log('    1. cd ~/projects/my-project && mbridge');
+    console.log('    2. cloudflared tunnel --url http://localhost:8787');
+    console.log('    3. In chat, paste: connect to my local bridge at <your-tunnel-url>');
+  } else {
+    console.log('  cloudflared: not found. Next steps:');
+    console.log('    1. cd ~/projects/my-project && mbridge   (plain mbridge is now ready-to-code mode)');
+    console.log('    2. Install cloudflared for the tunnel, e.g.:');
+    console.log('       curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared && chmod +x cloudflared');
+    console.log('       then: ./cloudflared tunnel --url http://localhost:8787');
+    console.log('    3. In chat, paste: connect to my local bridge at <your-tunnel-url>');
+  }
+  console.log('');
+  console.log('  Warning: ready-to-code mode means a full shell in the project folder.');
+  console.log('  Use a private tunnel (Tailscale / named Cloudflare tunnel), never a public quick-tunnel URL.');
+  console.log('  To turn it off again, edit the config file and set both flags to false.');
+}
+
+// `code` mode is set here (before parseArgs) and applied right after it.
+// CODE_MODE is also used for the startup warning banner.
+let CODE_MODE = false;
+
 const subcommand = process.argv[2];
 if (subcommand === 'add' || subcommand === 'remove' || subcommand === 'list') {
   if (subcommand === 'add') cmdAdd(process.argv[3]);
@@ -245,8 +317,31 @@ if (subcommand === 'add' || subcommand === 'remove' || subcommand === 'list') {
   else cmdList();
   process.exit(0);
 }
+if (subcommand === 'setup') {
+  cmdSetup();
+  process.exit(0);
+}
+if (subcommand === 'code') {
+  // Ready-to-code mode: --allow-shell + --allow-git-write, as an explicit
+  // operator action (never from a tool call, never the silent default).
+  // Optional folder scopes the server to it (same guards as add/list);
+  // without one, the current folder is the scope, as usual.
+  // Strip 'code' (+ folder) from argv so parseArgs sees only the flags.
+  CODE_MODE = true;
+  const maybeFolder = process.argv[3];
+  if (maybeFolder && !maybeFolder.startsWith('-')) {
+    const v = validateRootDir(maybeFolder);
+    if (v.error) { console.error(`error: ${v.error}`); process.exit(1); }
+    process.chdir(v.path);
+    process.argv.splice(2, 2);
+  } else {
+    process.argv.splice(2, 1);
+  }
+}
 
 const opts = parseArgs(process.argv);
+// `mbridge code`: explicit ready-to-code mode — same as passing both flags.
+if (CODE_MODE) { opts.allowShell = true; opts.allowGitWrite = true; }
 // V2 guards: --allow-shell / --allow-git-write can also come from env or
 // config.json (same file as the roots). Flags, env and config are OR-ed;
 // there is no way to enable shell/git-write from a tool call — only the
@@ -1316,7 +1411,7 @@ async function dispatchTool(name, args) {
 function serveToolsList(res) {
   ok(res, {
     mode: opts.readOnly ? 'read-only' : 'read-write',
-    version: '0.3.0',
+    version: '0.3.1',
     shell_enabled: SHELL_ENABLED,
     git_write_enabled: GIT_WRITE_ENABLED,
     project_roots: getRoots().map(r => r.path),
@@ -1408,8 +1503,9 @@ function serveSkill(res) {
 // ---------------------------------------------------------------------------
 function runMcpServer() {
   const readline = require('node:readline');
-  console.error('[mcp] muse-ai-local-bridge 0.3.0 (stdio MCP mode)');
-  console.error(`[mcp] roots: ${getRoots().map((r) => r.path).join(', ')} mode=${opts.readOnly ? 'read-only' : 'read-write'} shell=${SHELL_ENABLED} git_write=${GIT_WRITE_ENABLED}`);
+  console.error('[mcp] muse-ai-local-bridge 0.3.1 (stdio MCP mode)');
+  console.error(`[mcp] roots: ${getRoots().map((r) => r.path).join(', ')} mode=${opts.readOnly ? 'read-only' : 'read-write'} shell=${SHELL_ENABLED} git_write=${GIT_WRITE_ENABLED}${CODE_MODE ? ' (code mode)' : ''}`);
+  if (CODE_MODE && !opts.readOnly) console.error('[mcp] CODE MODE: full shell + git write ON for this folder only — use a private tunnel.');
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
   function sendRpc(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
   rl.on('line', async (line) => {
@@ -1419,7 +1515,7 @@ function runMcpServer() {
     const isNotification = id === undefined || id === null;
     if (msg.method === 'notifications/initialized' || (typeof msg.method === 'string' && msg.method.startsWith('notifications/'))) return;
     if (msg.method === 'initialize') {
-      return sendRpc({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'muse-ai-local-bridge', version: '0.3.0' } } });
+      return sendRpc({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'muse-ai-local-bridge', version: '0.3.1' } } });
     }
     if (msg.method === 'ping') return sendRpc({ jsonrpc: '2.0', id, result: {} });
     if (msg.method === 'tools/list') {
@@ -1520,9 +1616,16 @@ if (opts.mcp) { runMcpServer(); } else server.listen(opts.port, '127.0.0.1', () 
   const addr = server.address();
   const port = typeof addr === 'object' ? addr.port : opts.port;
   console.error('');
-  console.error('muse-ai-local-bridge server running (V3 fork 0.3.0)');
+  console.error('muse-ai-local-bridge server running (V3 fork 0.3.1)');
   console.error(`  roots: ${getRoots().map(r => r.path).join(', ')}`);
   console.error(`  mode : ${opts.readOnly ? 'read-only' : 'read-write (read + write + commands)'}`);
+  if (CODE_MODE && !opts.readOnly) {
+    console.error('  CODE MODE: full shell + git write ON for this folder only.');
+    console.error('  A shell here can read .env and run anything in the root.');
+    console.error('  Use a private tunnel (Tailscale / named Cloudflare tunnel).');
+  } else if (CODE_MODE && opts.readOnly) {
+    console.error('  CODE MODE requested, but --read-only wins: shell + git write are OFF.');
+  }
   console.error(`  local: http://127.0.0.1:${port}`);
   // Token goes to stderr ONLY (v3): stdout is for MCP JSON-RPC and must
   // never carry a secret; systemd/tmux logs also capture stdout.

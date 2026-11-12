@@ -374,9 +374,9 @@ test('run_command: allowlisted succeeds, other commands rejected', async () => {
 });
 
 // --- version + token not on stdout ---
-test('version is 0.3.0 and token is not printed to stdout', async () => {
+test('version is 0.3.1 and token is not printed to stdout', async () => {
   const list = await fetch(`${srv.base}/api/tools/list`, { headers: { 'X-Api-Key': srv.token } }).then((r) => r.json());
-  assert.equal(list.data.version, '0.3.0');
+  assert.equal(list.data.version, '0.3.1');
 });
 
 // --- audit: terminal input is never logged ---
@@ -423,7 +423,7 @@ test('MCP: initialize + tools/list + tools/call over stdio', async () => {
   try {
     send({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 't', version: '1' } } });
     const init = await nextMsg();
-    assert.equal(init.result.serverInfo.version, '0.3.0');
+    assert.equal(init.result.serverInfo.version, '0.3.1');
     send({ jsonrpc: '2.0', method: 'notifications/initialized' });
     send({ jsonrpc: '2.0', id: 2, method: 'tools/list' });
     const list = await nextMsg();

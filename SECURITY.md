@@ -90,6 +90,17 @@ honest trade-off:
   (`MUSE_BRIDGE_ALLOW_SHELL=1`, `MUSE_BRIDGE_ALLOW_GIT_WRITE=1`), or
   `allow_shell` / `allow_git_write` in `config.json`. A tool call from
   chat can never turn them on. `--read-only` overrides all of them.
+- **v0.3.1 ease-of-use (`code` / `setup`) changes nothing above.**
+  `mbridge code` is exactly the two flags, typed once; `mbridge setup`
+  only writes those two flags into `config.json` (merging, roots kept,
+  token untouched) so a later plain `mbridge` reads them back. The
+  plain server without `setup`/`code` stays allowlist-only — the
+  default was NOT changed silently. The trade-off is recorded here on
+  purpose: the convenience is one explicit operator decision, stored
+  in a file only the operator can write; anyone who can write that
+  config file could already run any shell on the machine, so `setup`
+  adds no new trust boundary. The server prints a warning banner in
+  `code` mode at startup.
 - **Scope still holds:** terminals, exec jobs and git commands all run
   with cwd locked to the project root; path arguments still go through
   the V1 root resolver + blocklist (file tools, `git_commit --files`).
