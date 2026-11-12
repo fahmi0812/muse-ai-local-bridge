@@ -1,6 +1,15 @@
 #!/usr/bin/env node
 /**
- * muse-ai-local-bridge — server (V1)
+ * muse-ai-local-bridge — server (V2, fork)
+ *
+ * V2 adds, without breaking any V1 tool: persistent terminals,
+ * async exec jobs, opt-in full shell (--allow-shell, OFF by default),
+ * full git write (gated by --allow-git-write), glob/grep search,
+ * a local skill loader, and a stdio MCP mode (--mcp).
+ * See PROTOCOL.md section 10 and README.md "V2" for the trade-offs:
+ * --allow-shell can run anything in the project root, including
+ * reading secrets via the shell — use it only behind a private
+ * tunnel (Tailscale / named Cloudflare tunnel), never a public URL.
  *
  * Gives an AI client (e.g. Muse at muse.ai) scoped read access to the
  * folder this command runs in, over a GET-based tool API (see PROTOCOL.md).
@@ -23,14 +32,14 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { spawnSync } = require('node:child_process');
+const { spawn, spawnSync } = require('node:child_process');
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 function printHelp() {
-  console.log(`muse-ai-local-bridge server (V1)
+  console.log(`muse-ai-local-bridge server (V2 fork)
 
 Usage: server.js [options]
        server.js add <folder> | remove <name-or-path> | list
@@ -43,6 +52,17 @@ Usage: server.js [options]
   --token-file p    persist the API token in file p (mode 0600) instead of
                     the default ~/.muse-ai-local-bridge/token
   --new-token       generate a fresh token, replacing the saved one
+  --allow-shell     V2, OFF by default: enable terminal_* / exec_* with a
+                    real bash shell (scoped to the project root, token +
+                    audit still apply). Without it those tools are hidden.
+                    Also enabled by MUSE_BRIDGE_ALLOW_SHELL=1 or
+                    {"allow_shell": true} in ~/.muse-ai-local-bridge/config.json
+  --allow-git-write V2, OFF by default: enable git_commit / git_push /
+                    git_checkout. Also MUSE_BRIDGE_ALLOW_GIT_WRITE=1 or
+                    {"allow_git_write": true} in config.json
+  --mcp             V2: run as a stdio MCP server (JSON-RPC over stdin/
+                    stdout) instead of the HTTP GET API, for OpenCode /
+                    Claude Desktop. No HTTP port is opened in this mode.
   -h, --help        this text
 
 The working directory where this command runs becomes the single access
@@ -51,7 +71,7 @@ Listens on 127.0.0.1 only — publish it with your own tunnel.`);
 }
 
 function parseArgs(argv) {
-  const opts = { port: 8787, readOnly: false, allow: [], tokenFile: null, newToken: false };
+  const opts = { port: 8787, readOnly: false, allow: [], tokenFile: null, newToken: false, allowShell: false, allowGitWrite: false, mcp: false };
   const args = argv.slice(2);
   const needValue = (i, flag) => {
     if (i >= args.length) { console.error(`error: ${flag} needs a value`); process.exit(2); }
@@ -73,6 +93,12 @@ function parseArgs(argv) {
       opts.tokenFile = needValue(++i, a);
     } else if (a === '--new-token') {
       opts.newToken = true;
+    } else if (a === '--allow-shell') {
+      opts.allowShell = true;
+    } else if (a === '--allow-git-write') {
+      opts.allowGitWrite = true;
+    } else if (a === '--mcp') {
+      opts.mcp = true;
     } else if (a === '-h' || a === '--help') {
       printHelp();
       process.exit(0);
@@ -203,6 +229,30 @@ if (subcommand === 'add' || subcommand === 'remove' || subcommand === 'list') {
 }
 
 const opts = parseArgs(process.argv);
+// V2 guards: --allow-shell / --allow-git-write can also come from env or
+// config.json (same file as the roots). Flags, env and config are OR-ed;
+// there is no way to enable shell/git-write from a tool call — only the
+// operator who starts the server can. --read-only still wins over all of it.
+try {
+  if (process.env.MUSE_BRIDGE_ALLOW_SHELL === '1') opts.allowShell = true;
+  if (process.env.MUSE_BRIDGE_ALLOW_GIT_WRITE === '1') opts.allowGitWrite = true;
+  const _cfgRaw = require('node:fs').readFileSync(require('node:path').join(require('node:os').homedir(), '.muse-ai-local-bridge', 'config.json'), 'utf8');
+  const _cfg = JSON.parse(_cfgRaw);
+  if (_cfg && _cfg.allow_shell === true) opts.allowShell = true;
+  if (_cfg && _cfg.allow_git_write === true) opts.allowGitWrite = true;
+} catch { /* no config / no env: flags alone decide */ }
+const SHELL_ENABLED = !opts.readOnly && opts.allowShell;
+const GIT_WRITE_ENABLED = !opts.readOnly && opts.allowGitWrite;
+function shellGate() {
+  if (opts.readOnly) return { error: 'MODE_READ_ONLY', message: 'server is in read-only mode' };
+  if (!opts.allowShell) return { error: 'SHELL_NOT_ENABLED', message: 'full shell is off — restart with --allow-shell (see README V2 / SECURITY.md)' };
+  return null;
+}
+function gitWriteGate() {
+  if (opts.readOnly) return { error: 'MODE_READ_ONLY', message: 'server is in read-only mode' };
+  if (!opts.allowGitWrite) return { error: 'GIT_WRITE_NOT_ALLOWED', message: 'git write is off — restart with --allow-git-write (or MUSE_BRIDGE_ALLOW_GIT_WRITE=1)' };
+  return null;
+}
 
 /**
  * Explicit multi-root config. Returns [{name, path}] or null when absent.
@@ -877,6 +927,306 @@ function tool_run_command(args) {
   return { command: cmd, exit_code: r.status, output, truncated: output.length >= 200000 };
 }
 
+
+// ---------------------------------------------------------------------------
+// V2 tools — persistent terminals, async exec, glob/grep, skills, git write
+// All of these respect the same root scope, token and audit log as V1.
+// Shell/git-write tools are NOT registered unless their flag is on
+// (see the registry below); read tools are always available.
+// ---------------------------------------------------------------------------
+
+const TERMINALS = new Map(); // id -> {id, child, root, buffer, exitCode, createdAt}
+let termSeq = 0;
+const TERM_BUF_MAX = 512 * 1024;
+function termAppend(t, chunk) {
+  t.buffer += chunk;
+  if (t.buffer.length > TERM_BUF_MAX) t.buffer = t.buffer.slice(t.buffer.length - TERM_BUF_MAX);
+}
+function tool_terminal_create(args) {
+  const g = shellGate(); if (g) return g;
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const id = `term-${++termSeq}`;
+  const child = spawn('bash', [], { cwd: sel.root.path, env: { ...process.env, TERM: 'xterm-256color' } });
+  const t = { id, child, root: sel.root, buffer: '', exitCode: null, createdAt: new Date().toISOString() };
+  child.stdout.on('data', (d) => termAppend(t, d.toString('utf8')));
+  child.stderr.on('data', (d) => termAppend(t, d.toString('utf8')));
+  child.on('exit', (code) => { t.exitCode = code; });
+  child.on('error', (e) => { t.exitCode = -1; termAppend(t, `\n[terminal spawn error: ${e.message}]\n`); });
+  TERMINALS.set(id, t);
+  auditLog('terminal_create', `${id} in ${sel.root.path}`, 'ok');
+  return { id, project: sel.root.name, pid: child.pid, running: true };
+}
+function tool_terminal_list() {
+  const g = shellGate(); if (g) return g;
+  return { terminals: [...TERMINALS.values()].map((t) => ({ id: t.id, project: t.root.name, pid: t.child.pid, running: t.exitCode === null, exit_code: t.exitCode, buffered_bytes: t.buffer.length })) };
+}
+function tool_terminal_send(args) {
+  const g = shellGate(); if (g) return g;
+  if (!args.id || typeof args.id !== 'string') return { error: 'BAD_ARGS', message: 'id is required (from terminal_create)' };
+  if (typeof args.input !== 'string') return { error: 'BAD_ARGS', message: 'input is required (include a trailing newline to run it)' };
+  const t = TERMINALS.get(args.id);
+  if (!t) return { error: 'BAD_ARGS', message: `unknown terminal: ${args.id}` };
+  if (t.exitCode !== null) return { error: 'TERMINAL_CLOSED', message: `terminal ${args.id} already exited (${t.exitCode})` };
+  try { t.child.stdin.write(args.input); } catch (e) { return { error: 'INTERNAL_ERROR', message: e.message }; }
+  auditLog('terminal_send', args.id, args.input.slice(0, 200).replace(/\n/g, '\\n'));
+  return { id: args.id, sent_bytes: Buffer.byteLength(args.input, 'utf8') };
+}
+function tool_terminal_read(args) {
+  const g = shellGate(); if (g) return g;
+  if (!args.id || typeof args.id !== 'string') return { error: 'BAD_ARGS', message: 'id is required' };
+  const t = TERMINALS.get(args.id);
+  if (!t) return { error: 'BAD_ARGS', message: `unknown terminal: ${args.id}` };
+  const offset = Math.max(parseInt(args.offset ?? 0, 10) || 0, 0);
+  return { id: args.id, output: t.buffer.slice(offset), offset: t.buffer.length, running: t.exitCode === null, exit_code: t.exitCode };
+}
+function tool_terminal_kill(args) {
+  const g = shellGate(); if (g) return g;
+  if (!args.id || typeof args.id !== 'string') return { error: 'BAD_ARGS', message: 'id is required' };
+  const t = TERMINALS.get(args.id);
+  if (!t) return { error: 'BAD_ARGS', message: `unknown terminal: ${args.id}` };
+  try { t.child.kill('SIGTERM'); } catch { /* already dead */ }
+  TERMINALS.delete(args.id);
+  auditLog('terminal_kill', args.id, 'ok');
+  return { id: args.id, killed: true };
+}
+
+// --- async exec jobs ---
+const JOBS = new Map();
+let jobSeq = 0;
+function tool_exec_start(args) {
+  const g = shellGate(); if (g) return g;
+  if (!args.command || typeof args.command !== 'string') return { error: 'BAD_ARGS', message: 'command is required' };
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const cmd = args.command.trim();
+  let child;
+  if (opts.allowShell) {
+    child = spawn('bash', ['-c', cmd], { cwd: sel.root.path });
+  } else {
+    // Unreachable when the registry is built correctly (tool hidden when
+    // shell is off), but keep the allowlist path as a defence in depth.
+    if (METACHAR.test(cmd)) return { error: 'COMMAND_REJECTED_METACHAR', message: 'command contains shell metacharacters' };
+    if (!ALLOWLIST.includes(cmd)) return { error: 'COMMAND_NOT_ALLOWED', message: `command not on the allowlist: ${cmd}` };
+    const argv = cmd.split(/\s+/);
+    child = spawn(argv[0], argv.slice(1), { cwd: sel.root.path });
+  }
+  const timeoutMs = Math.min(Math.max((parseInt(args.timeout_s ?? 600, 10) || 600), 1), 1800) * 1000;
+  const id = `job-${++jobSeq}`;
+  const job = { id, child, command: cmd, output: '', exitCode: null, status: 'running', startedAt: new Date().toISOString() };
+  child.stdout.on('data', (d) => { job.output += d.toString('utf8'); if (job.output.length > 512 * 1024) job.output = job.output.slice(-512 * 1024); });
+  child.stderr.on('data', (d) => { job.output += d.toString('utf8'); if (job.output.length > 512 * 1024) job.output = job.output.slice(-512 * 1024); });
+  child.on('exit', (code) => { if (job.status === 'running') { job.status = 'done'; job.exitCode = code; } });
+  child.on('error', (e) => { job.status = 'done'; job.exitCode = -1; job.output += `\n[spawn error: ${e.message}]\n`; });
+  job.timer = setTimeout(() => { if (job.status === 'running') { job.status = 'timeout'; try { child.kill('SIGKILL'); } catch {} } }, timeoutMs);
+  if (job.timer.unref) job.timer.unref();
+  JOBS.set(id, job);
+  auditLog('exec_start', id, cmd.slice(0, 200));
+  return { job_id: id, status: 'running', command: cmd };
+}
+function tool_exec_poll(args) {
+  const g = shellGate(); if (g) return g;
+  const id = args.job_id || args.id;
+  if (!id || typeof id !== 'string') return { error: 'BAD_ARGS', message: 'job_id is required (from exec_start)' };
+  const job = JOBS.get(id);
+  if (!job) return { error: 'BAD_ARGS', message: `unknown job: ${id}` };
+  return { job_id: id, status: job.status, exit_code: job.exitCode, output: job.output, truncated: job.output.length >= 512 * 1024 };
+}
+function tool_exec_kill(args) {
+  const g = shellGate(); if (g) return g;
+  const id = args.job_id || args.id;
+  if (!id || typeof id !== 'string') return { error: 'BAD_ARGS', message: 'job_id is required' };
+  const job = JOBS.get(id);
+  if (!job) return { error: 'BAD_ARGS', message: `unknown job: ${id}` };
+  if (job.status === 'running') { job.status = 'killed'; try { job.child.kill('SIGKILL'); } catch {} clearTimeout(job.timer); }
+  auditLog('exec_kill', id, job.status);
+  return { job_id: id, status: job.status, killed: true };
+}
+
+// --- glob / grep (stronger search than literal search_code) ---
+function globToRegExp(glob) {
+  let re = '';
+  for (let i = 0; i < glob.length; i++) {
+    const c = glob[i];
+    if (c === '*') {
+      if (glob[i + 1] === '*') { // ** : any depth (with optional trailing /)
+        if (glob[i + 2] === '/') { re += '(?:.*/)?'; i += 2; } else { re += '.*'; i++; }
+      } else re += '[^/]*';
+    } else if (c === '?') re += '[^/]';
+    else if ('.+^${}()|[\\]'.includes(c)) re += '\\' + c;
+    else re += c;
+  }
+  return new RegExp('^' + re + '$');
+}
+function walkFiles(root, startAbs, onFile, cap) {
+  let seen = 0;
+  function walk(dir) {
+    if (seen >= cap) return;
+    let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      if (seen >= cap) return;
+      if (e.name.startsWith('.') && e.name !== '.') continue;
+      const abs = path.join(dir, e.name);
+      const rel = path.relative(root.path, abs);
+      const isDir = e.isDirectory();
+      if (isIgnored(rel, isDir, root) || isBlocked(abs, root)) continue;
+      if (isDir) { walk(abs); continue; }
+      seen++;
+      onFile(abs, rel);
+    }
+  }
+  const st = fs.statSync(startAbs);
+  if (st.isDirectory()) walk(startAbs);
+  else onFile(startAbs, path.relative(root.path, startAbs));
+}
+function tool_glob_files(args) {
+  if (!args.pattern || typeof args.pattern !== 'string') return { error: 'BAD_ARGS', message: 'pattern is required (e.g. **/*.md)' };
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const root = sel.root;
+  const r = resolveInRoot(args.path || '.', root); if (r.error) return { error: r.error, message: r.message };
+  const re = globToRegExp(args.pattern);
+  const maxResults = Math.min(Math.max(parseInt(args.max_results ?? 500, 10) || 500, 1), 2000);
+  const out = [];
+  walkFiles(root, r.path, (abs, rel) => {
+    if (out.length >= maxResults) return;
+    const relPosix = rel.split(path.sep).join('/');
+    if (re.test(relPosix) || (!args.pattern.includes('/') && re.test(path.basename(relPosix)))) out.push(relPosix);
+  }, 5000);
+  return { pattern: args.pattern, files: out.sort(), truncated: out.length >= maxResults };
+}
+function tool_grep_code(args) {
+  if (!args.pattern || typeof args.pattern !== 'string') return { error: 'BAD_ARGS', message: 'pattern is required (regex)' };
+  let re;
+  try { re = new RegExp(args.pattern, args.case_insensitive === true ? 'i' : ''); }
+  catch (e) { return { error: 'BAD_ARGS', message: `invalid regex: ${e.message}` }; }
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const root = sel.root;
+  const r = resolveInRoot(args.path || '.', root); if (r.error) return { error: r.error, message: r.message };
+  const contextLines = Math.min(Math.max(parseInt(args.context_lines ?? 2, 10) || 0, 0), 5);
+  const fileGlob = args.file_glob ? globToRegExp(args.file_glob) : null;
+  const matches = []; const CAP = 200;
+  walkFiles(root, r.path, (abs, rel) => {
+    if (matches.length >= CAP) return;
+    if (fileGlob && !fileGlob.test(path.basename(abs))) return;
+    let buf; try { const st = fs.statSync(abs); if (st.size > 1024 * 1024) return; buf = fs.readFileSync(abs); } catch { return; }
+    if (isBinary(buf.subarray(0, 8000))) return;
+    const lines = buf.toString('utf8').split('\n');
+    for (let i = 0; i < lines.length && matches.length < CAP; i++) {
+      if (re.test(lines[i])) {
+        const start = Math.max(0, i - contextLines), end = Math.min(lines.length, i + contextLines + 1);
+        matches.push({ path: rel.split(path.sep).join('/'), line: i + 1, context: lines.slice(start, end).join('\n') });
+      }
+    }
+  }, 5000);
+  return { pattern: args.pattern, matches, truncated: matches.length >= CAP };
+}
+
+// --- local skill loader (skills/ + .agents/skills/ + .opencode/skills/) ---
+const SKILL_DIRS = ['skills', '.agents/skills', '.opencode/skills'];
+function findSkills(root) {
+  const out = [];
+  for (const dirName of SKILL_DIRS) {
+    const base = path.join(root.path, dirName);
+    if (!fs.existsSync(base)) continue;
+    let entries; try { entries = fs.readdirSync(base, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (!e.isDirectory()) continue;
+      const skillFile = path.join(base, e.name, 'SKILL.md');
+      if (!fs.existsSync(skillFile)) continue;
+      let description = '';
+      try {
+        const text = fs.readFileSync(skillFile, 'utf8');
+        const fm = text.match(/^---\n([\s\S]*?)\n---/);
+        if (fm) { const d = fm[1].match(/^description:\s*(.+)$/m); if (d) description = d[1].trim(); }
+        if (!description) {
+          const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
+          const firstPara = lines.find((l) => !l.startsWith('#') && !l.startsWith('---'));
+          if (firstPara) description = firstPara.slice(0, 200);
+        }
+      } catch { /* description stays empty */ }
+      out.push({ name: e.name, path: path.relative(root.path, skillFile).split(path.sep).join('/'), description, source: dirName });
+    }
+  }
+  return out;
+}
+function tool_list_skills(args) {
+  const sel = selectRoot(args); if (sel.error) return sel;
+  return { skills: findSkills(sel.root) };
+}
+function tool_read_skill(args) {
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const root = sel.root;
+  const skills = findSkills(root);
+  const want = String(args.name || args.path || '');
+  if (!want) return { error: 'BAD_ARGS', message: 'name (or path) is required — see list_skills' };
+  const hit = skills.find((sk) => sk.name === want || sk.path === want || sk.path.endsWith('/' + want) || want.endsWith(sk.path));
+  if (!hit) return { error: 'BAD_ARGS', message: `unknown skill: ${want} (see list_skills)` };
+  const r = resolveInRoot(hit.path, root); if (r.error) return { error: r.error, message: r.message };
+  const content = fs.readFileSync(r.path, 'utf8');
+  if (Buffer.byteLength(content, 'utf8') > MAX_WRITE_BYTES) return { error: 'BAD_ARGS', message: 'skill file too large' };
+  return { name: hit.name, path: hit.path, content };
+}
+
+// --- full git (write side gated by --allow-git-write) ---
+const GIT_REF_RE = /^[A-Za-z0-9._\/-]+$/;
+function tool_git_branch(args) {
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const root = sel.root;
+  if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
+  const r = gitRun(['branch', '--format=%(refname:short)'], root);
+  if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: (r.stderr || 'git branch failed').trim() };
+  const cur = gitRun(['rev-parse', '--abbrev-ref', 'HEAD'], root);
+  return { current: cur.status === 0 ? cur.stdout.trim() : null, branches: r.stdout.split('\n').filter(Boolean) };
+}
+function tool_git_commit(args) {
+  const g = gitWriteGate(); if (g) return g;
+  if (!args.message || typeof args.message !== 'string' || !args.message.trim()) return { error: 'BAD_ARGS', message: 'message is required' };
+  if (args.message.length > 500) return { error: 'BAD_ARGS', message: 'message too long (max 500 chars)' };
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const root = sel.root;
+  if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
+  if (args.all === true) {
+    const a = gitRun(['add', '-A'], root); if (a.status !== 0) return { error: 'INTERNAL_ERROR', message: (a.stderr || 'git add failed').trim() };
+  } else if (Array.isArray(args.files) && args.files.length) {
+    const absFiles = [];
+    for (const f of args.files) {
+      if (typeof f !== 'string') return { error: 'BAD_ARGS', message: 'files must be strings' };
+      const rr = resolveInRoot(f, root); if (rr.error) return { error: rr.error, message: rr.message };
+      if (isBlocked(rr.path, root)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
+      absFiles.push(rr.path);
+    }
+    const a = gitRun(['add', '--', ...absFiles], root); if (a.status !== 0) return { error: 'INTERNAL_ERROR', message: (a.stderr || 'git add failed').trim() };
+  }
+  const c = gitRun(['commit', '-m', args.message.trim()], root, 30000);
+  if (c.status !== 0) return { error: 'INTERNAL_ERROR', message: (c.stderr || c.stdout || 'git commit failed').trim().slice(0, 2000) };
+  const h = gitRun(['rev-parse', 'HEAD'], root);
+  auditLog('git_commit', root.path, args.message.trim().slice(0, 120));
+  return { commit: h.status === 0 ? h.stdout.trim() : null, message: args.message.trim() };
+}
+function tool_git_push(args) {
+  const g = gitWriteGate(); if (g) return g;
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const root = sel.root;
+  if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
+  const remote = args.remote || 'origin', branch = args.branch || null;
+  if (!GIT_REF_RE.test(remote) || (branch && !GIT_REF_RE.test(branch))) return { error: 'BAD_ARGS', message: 'invalid remote/branch name' };
+  const gitArgs = ['push', remote]; if (branch) gitArgs.push(branch);
+  const r = gitRun(gitArgs, root, 120000);
+  if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: ((r.stderr || r.stdout || 'git push failed').trim().slice(0, 2000)) };
+  auditLog('git_push', root.path, `${remote}${branch ? ' ' + branch : ''}`);
+  return { remote, branch: branch || null, output: (r.stdout + r.stderr).slice(0, 2000) };
+}
+function tool_git_checkout(args) {
+  const g = gitWriteGate(); if (g) return g;
+  if (!args.branch || typeof args.branch !== 'string' || !GIT_REF_RE.test(args.branch)) return { error: 'BAD_ARGS', message: 'branch is required (letters, digits, . _ / - only)' };
+  const sel = selectRoot(args); if (sel.error) return sel;
+  const root = sel.root;
+  if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
+  const gitArgs = args.create === true ? ['checkout', '-b', args.branch] : ['checkout', args.branch];
+  const r = gitRun(gitArgs, root, 30000);
+  if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: ((r.stderr || 'git checkout failed').trim().slice(0, 2000)) };
+  auditLog('git_checkout', root.path, args.branch);
+  return { branch: args.branch, created: args.create === true };
+}
+
 // ---------------------------------------------------------------------------
 // Tool registry (names frozen per PROTOCOL.md — do not rename)
 // ---------------------------------------------------------------------------
@@ -909,6 +1259,23 @@ const READ_TOOLS = {
     description: 'Recent commits.',
     parameters: { limit: 'integer 1-100 (default 20)' },
   },
+  glob_files: {
+    fn: tool_glob_files,
+    description: 'V2: list files matching a glob (e.g. **/*.md). Respects .gitignore.',
+    parameters: { pattern: 'string (required)', path: 'string (default ".")', max_results: 'integer (default 500)' },
+  },
+  grep_code: {
+    fn: tool_grep_code,
+    description: 'V2: regex search (unlike literal search_code).',
+    parameters: { pattern: 'string (required, regex)', path: 'string (default ".")', file_glob: 'string', context_lines: 'integer 0-5 (default 2)', case_insensitive: 'bool (default false)' },
+  },
+  list_skills: { fn: tool_list_skills, description: 'V2: list local SKILL.md skills (skills/, .agents/skills/, .opencode/skills/).', parameters: {} },
+  read_skill: {
+    fn: tool_read_skill,
+    description: 'V2: read one local skill by name (see list_skills).',
+    parameters: { name: 'string (required, or path)' },
+  },
+  git_branch: { fn: tool_git_branch, description: 'V2: list git branches + current branch.', parameters: {} },
 };
 
 // Write tools and run_command are only registered in read-write mode
@@ -935,11 +1302,48 @@ const WRITE_TOOLS = {
     parameters: { command: 'string (required)', timeout_s: 'integer 1-1800 (default 600)' },
   },
 };
-const ALL_TOOLS = opts.readOnly ? READ_TOOLS : { ...READ_TOOLS, ...WRITE_TOOLS };
+const V2_SHELL_TOOLS = {
+  terminal_create: { fn: tool_terminal_create, description: 'V2: create a persistent bash session in the project root. Requires --allow-shell.', parameters: {} },
+  terminal_list: { fn: tool_terminal_list, description: 'V2: list persistent terminals.', parameters: {} },
+  terminal_send: { fn: tool_terminal_send, description: 'V2: send input to a terminal (include trailing newline to run).', parameters: { id: 'string (required)', input: 'string (required)' } },
+  terminal_read: { fn: tool_terminal_read, description: 'V2: read buffered terminal output from an offset.', parameters: { id: 'string (required)', offset: 'integer (default 0)' } },
+  terminal_kill: { fn: tool_terminal_kill, description: 'V2: kill and remove a terminal.', parameters: { id: 'string (required)' } },
+  exec_start: { fn: tool_exec_start, description: 'V2: start a long command as an async job; poll with exec_poll. Requires --allow-shell.', parameters: { command: 'string (required)', timeout_s: 'integer 1-1800 (default 600)' } },
+  exec_poll: { fn: tool_exec_poll, description: 'V2: poll an async exec job.', parameters: { job_id: 'string (required)' } },
+  exec_kill: { fn: tool_exec_kill, description: 'V2: kill an async exec job.', parameters: { job_id: 'string (required)' } },
+};
+const V2_GIT_WRITE_TOOLS = {
+  git_commit: { fn: tool_git_commit, description: 'V2: git commit. Requires --allow-git-write.', parameters: { message: 'string (required)', all: 'bool (git add -A first)', files: 'array of paths to stage' } },
+  git_push: { fn: tool_git_push, description: 'V2: git push. Requires --allow-git-write.', parameters: { remote: 'string (default origin)', branch: 'string (optional)' } },
+  git_checkout: { fn: tool_git_checkout, description: 'V2: git checkout (or -b with create:true). Requires --allow-git-write.', parameters: { branch: 'string (required)', create: 'bool (default false)' } },
+};
+const ALL_TOOLS = opts.readOnly ? READ_TOOLS
+  : { ...READ_TOOLS, ...WRITE_TOOLS, ...(SHELL_ENABLED ? V2_SHELL_TOOLS : {}), ...(GIT_WRITE_ENABLED ? V2_GIT_WRITE_TOOLS : {}) };
+const KNOWN_TOOLS = new Set([...Object.keys(READ_TOOLS), ...Object.keys(WRITE_TOOLS), ...Object.keys(V2_SHELL_TOOLS), ...Object.keys(V2_GIT_WRITE_TOOLS)]);
+/** Shared dispatch for HTTP and MCP: returns {data} or {error, message}. */
+function dispatchTool(name, args) {
+  const tool = ALL_TOOLS[name];
+  if (!tool) {
+    if (Object.keys(V2_SHELL_TOOLS).includes(name)) return { error: opts.readOnly ? 'MODE_READ_ONLY' : 'SHELL_NOT_ENABLED', message: opts.readOnly ? 'server is in read-only mode' : 'full shell is off — restart with --allow-shell' };
+    if (Object.keys(V2_GIT_WRITE_TOOLS).includes(name)) return { error: opts.readOnly ? 'MODE_READ_ONLY' : 'GIT_WRITE_NOT_ALLOWED', message: opts.readOnly ? 'server is in read-only mode' : 'git write is off — restart with --allow-git-write' };
+    if (Object.keys(WRITE_TOOLS).includes(name)) return { error: 'MODE_READ_ONLY', message: `tool "${name}" is not available in read-only mode` };
+    return { error: 'UNKNOWN_TOOL', message: `unknown tool: ${name} (see /api/tools/list)` };
+  }
+  try {
+    const result = tool.fn(args || {});
+    if (result && result.error) return { error: result.error, message: result.message || result.error };
+    return { data: result };
+  } catch (e) {
+    return { error: 'INTERNAL_ERROR', message: `tool crashed: ${e.message}` };
+  }
+}
 
 function serveToolsList(res) {
   ok(res, {
     mode: opts.readOnly ? 'read-only' : 'read-write',
+    version: '0.2.0',
+    shell_enabled: SHELL_ENABLED,
+    git_write_enabled: GIT_WRITE_ENABLED,
     project_roots: getRoots().map(r => r.path),
     // How to call a tool — shown here because this is the response every
     // client reads before calling anything. Do NOT invent other URL shapes.
@@ -967,12 +1371,6 @@ function handleCall(url, res) {
   const name = url.searchParams.get('tool');
   const rawArgs = url.searchParams.get('args') || '{}';
   if (!name) return fail(res, 400, 'BAD_ARGS', 'missing tool parameter');
-  const tool = ALL_TOOLS[name];
-  if (!tool) {
-    const known = Object.keys(READ_TOOLS).includes(name);
-    return fail(res, 404, known ? 'MODE_READ_ONLY' : 'UNKNOWN_TOOL',
-      known ? `tool "${name}" is not available in read-only mode` : `unknown tool: ${name} (see /api/tools/list)`);
-  }
   let args;
   try {
     args = JSON.parse(rawArgs);
@@ -980,28 +1378,21 @@ function handleCall(url, res) {
   } catch {
     return fail(res, 400, 'BAD_ARGS', 'args is not a valid JSON object');
   }
-  // Compatibility: some client frameworks flatten parameters into individual
-  // query params (?tool=read_file&path=x&limit=50) instead of the args JSON
-  // object. Merge them in; the args JSON wins on key conflicts.
   const flat = {};
   for (const [k, v] of url.searchParams) {
     if (k === 'tool' || k === 'args') continue;
     flat[k] = coerceFlatValue(v);
   }
   args = { ...flat, ...args };
-  let result;
-  try {
-    result = tool.fn(args);
-  } catch (e) {
-    return fail(res, 500, 'INTERNAL_ERROR', `tool crashed: ${e.message}`);
-  }
-  if (result && result.error) {
-    const status = result.error === 'PATH_OUTSIDE_ROOT' || result.error === 'FILE_BLOCKED' ? 403
-      : result.error === 'PATH_NOT_FOUND' ? 404
+  const out = dispatchTool(name, args);
+  if (out.error) {
+    const status = out.error === 'PATH_OUTSIDE_ROOT' || out.error === 'FILE_BLOCKED' || out.error === 'SHELL_NOT_ENABLED' || out.error === 'GIT_WRITE_NOT_ALLOWED' ? 403
+      : out.error === 'PATH_NOT_FOUND' ? 404
+      : out.error === 'MODE_READ_ONLY' ? 403
       : 400;
-    return fail(res, status, result.error, result.message || result.error);
+    return fail(res, status, out.error, out.message || out.error);
   }
-  ok(res, result);
+  ok(res, out.data);
 }
 
 // ---------------------------------------------------------------------------
@@ -1028,6 +1419,43 @@ function serveSkill(res) {
   const repoSkill = path.join(__dirname, 'skills', 'muse-ai-local-bridge', 'SKILL.md');
   const doc = fs.existsSync(repoSkill) ? fs.readFileSync(repoSkill, 'utf8') : EMBEDDED_SKILL;
   send(res, 200, doc, 'text/markdown; charset=utf-8');
+}
+
+
+// ---------------------------------------------------------------------------
+// V2 MCP mode (--mcp): stdio JSON-RPC 2.0, for OpenCode / Claude Desktop.
+// Local stdio is the trust boundary (no token over stdio); root scope,
+// read-only mode, shell/git-write flags still apply. Nothing is printed
+// to stdout except JSON-RPC responses; logs go to stderr.
+// ---------------------------------------------------------------------------
+function runMcpServer() {
+  const readline = require('node:readline');
+  console.error('[mcp] muse-ai-local-bridge 0.2.0 (stdio MCP mode)');
+  console.error(`[mcp] roots: ${getRoots().map((r) => r.path).join(', ')} mode=${opts.readOnly ? 'read-only' : 'read-write'} shell=${SHELL_ENABLED} git_write=${GIT_WRITE_ENABLED}`);
+  const rl = readline.createInterface({ input: process.stdin, terminal: false });
+  function sendRpc(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
+  rl.on('line', (line) => {
+    if (!line.trim()) return;
+    let msg; try { msg = JSON.parse(line); } catch { sendRpc({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }); return; }
+    const id = msg.id;
+    const isNotification = id === undefined || id === null;
+    if (msg.method === 'notifications/initialized' || (typeof msg.method === 'string' && msg.method.startsWith('notifications/'))) return;
+    if (msg.method === 'initialize') {
+      return sendRpc({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'muse-ai-local-bridge', version: '0.2.0' } } });
+    }
+    if (msg.method === 'ping') return sendRpc({ jsonrpc: '2.0', id, result: {} });
+    if (msg.method === 'tools/list') {
+      return sendRpc({ jsonrpc: '2.0', id, result: { tools: Object.entries(ALL_TOOLS).map(([name, t]) => ({ name, description: t.description, inputSchema: { type: 'object', properties: Object.fromEntries(Object.entries(t.parameters || {}).map(([k, v]) => [k, { type: 'string', description: String(v) }])), additionalProperties: true } })) } });
+    }
+    if (msg.method === 'tools/call') {
+      const name = msg.params && msg.params.name;
+      const args = (msg.params && msg.params.arguments) || {};
+      const out = dispatchTool(name, args);
+      if (out.error) return sendRpc({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code: out.error, message: out.message } }) }], isError: true } });
+      return sendRpc({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(out.data) }] } });
+    }
+    if (!isNotification) sendRpc({ jsonrpc: '2.0', id, error: { code: -32601, message: `method not found: ${msg.method}` } });
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1110,11 +1538,11 @@ const server = http.createServer(async (req, res) => {
     `unknown endpoint: ${url.pathname} (tools live at GET /api/tools/call?tool=<name>&... — see /skill.md)`);
 });
 
-server.listen(opts.port, '127.0.0.1', () => {
+if (opts.mcp) { runMcpServer(); } else server.listen(opts.port, '127.0.0.1', () => {
   const addr = server.address();
   const port = typeof addr === 'object' ? addr.port : opts.port;
   console.log('');
-  console.log('muse-ai-local-bridge server running (V1)');
+  console.log('muse-ai-local-bridge server running (V2 fork 0.2.0)');
   console.log(`  roots: ${getRoots().map(r => r.path).join(', ')}`);
   console.log(`  mode : ${opts.readOnly ? 'read-only' : 'read-write (read + write + commands)'}`);
   console.log(`  local: http://127.0.0.1:${port}`);

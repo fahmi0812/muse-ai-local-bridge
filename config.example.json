@@ -1,9 +1,11 @@
 {
-  "roots": [
-    "/home/you/projects/my-project",
-    {
-      "name": "blog",
-      "path": "/home/you/projects/blog"
-    }
-  ]
+    "allow_git_write": false,
+    "allow_shell": false,
+    "roots": [
+        "/home/you/projects/my-project",
+        {
+            "name": "blog",
+            "path": "/home/you/projects/blog"
+        }
+    ]
 }

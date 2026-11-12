@@ -43,6 +43,25 @@ into the owner's project folder(s). This file is public and needs no token.
   pipes, redirects, or variable expansion — request `--allow` additions from the
   owner instead of working around it.
 
+## V2 tools (only listed when the server was started with the matching flag)
+
+- `glob_files(pattern, path, max_results)` — glob search, e.g. `**/*.md`.
+- `grep_code(pattern, path, file_glob, context_lines, case_insensitive)` — regex search.
+- `list_skills()` / `read_skill(name)` — local `SKILL.md` skills from
+  `skills/`, `.agents/skills/`, `.opencode/skills/`. Read a skill before
+  following it, and prefer it over guessing.
+- `terminal_create()` / `terminal_send(id, input)` / `terminal_read(id, offset)` /
+  `terminal_kill(id)` (+ `terminal_list()`) — persistent bash, only when
+  `--allow-shell` is on. Send input with a trailing newline to run it;
+  poll `terminal_read` until `running` is false.
+- `exec_start(command, timeout_s)` / `exec_poll(job_id)` / `exec_kill(job_id)` —
+  async long commands, only when `--allow-shell` is on.
+- `git_branch()` (read), `git_commit(message, all, files)`, `git_push(remote, branch)`,
+  `git_checkout(branch, create)` — git write needs `--allow-git-write`.
+  If a tool is missing from `/api/tools/list`, its flag is off — say so
+  plainly and ask the owner to restart the server with the flag, don't
+  work around it.
+
 ## Errors
 
 `ok:false` with a `code` is normal — report it plainly:

@@ -219,3 +219,95 @@ to `~/.muse-ai-local-bridge/audit.log`:
   working.
 - Additive changes (new tools, new optional args, new error codes) do
   not require a version bump.
+
+## 10. V2 (fork, additive — V1 tools and endpoints are unchanged)
+
+V2 keeps every V1 tool, endpoint and error code, and adds the tools below.
+`/api/tools/list` now also returns `version: "0.2.0"`, `shell_enabled`
+and `git_write_enabled`, so a client can tell at a glance what is on.
+
+### 10.1 Persistent terminals (requires `--allow-shell`)
+
+| Tool | Args | Notes |
+|---|---|---|
+| `terminal_create` | `project` (optional) | Spawns one `bash` in the project root. Returns `id` (`term-N`) + pid. |
+| `terminal_list` | — | All live terminals: id, project, pid, running, buffered bytes. |
+| `terminal_send` | `id`, `input` | Writes to the shell's stdin. Include a trailing `\n` to run it. |
+| `terminal_read` | `id`, `offset` (default 0) | Buffered stdout+stderr from `offset`; returns new `offset`, `running`, `exit_code`. Buffer is capped at 512 KB (oldest output drops). |
+| `terminal_kill` | `id` | SIGTERM + remove from the list. |
+
+Terminals are per-project, cwd-locked to the root, and every
+`terminal_create` / `terminal_send` / `terminal_kill` is audit-logged.
+There is no idle auto-kill in v2 — kill terminals you no longer need.
+
+### 10.2 Async exec jobs (requires `--allow-shell`)
+
+| Tool | Args | Notes |
+|---|---|---|
+| `exec_start` | `command`, `project`, `timeout_s` (1–1800, default 600) | Runs via `bash -c` when shell is on; returns `job_id`. Output capped at 512 KB. |
+| `exec_poll` | `job_id` | `{status: running\|done\|timeout\|killed, exit_code, output}`. |
+| `exec_kill` | `job_id` | SIGKILL. |
+
+Use this for builds/tests that outlive one HTTP call. `run_command`
+(V1, allowlist, synchronous) is unchanged.
+
+### 10.3 Full shell — opt-in, default OFF
+
+`--allow-shell` (also `MUSE_BRIDGE_ALLOW_SHELL=1` or
+`{"allow_shell": true}` in `~/.muse-ai-local-bridge/config.json`)
+enables §10.1–10.2. Without it those tools are not listed and calls
+fail with `SHELL_NOT_ENABLED` (403). `--read-only` overrides the flag:
+in read-only mode no shell tool exists at all.
+
+**Trade-off, stated plainly:** a shell in the project root can read
+anything in that root — including `.env` files the V1 file tools refuse
+to serve — and can run any command. That is the whole point of the
+feature and also its risk. Only enable it behind a private tunnel
+(Tailscale / named Cloudflare tunnel), never a public quick-tunnel URL,
+and rotate the token if it may have leaked. See `SECURITY.md` §V2.
+
+### 10.4 Full git (write side requires `--allow-git-write`)
+
+| Tool | Args | Notes |
+|---|---|---|
+| `git_branch` | `project` | Read tool, always available. Lists branches + current branch. |
+| `git_commit` | `message` (≤500 chars), `all` (bool), `files` (array) | `all:true` runs `git add -A` first; `files` stages exactly those paths (each resolved in-root, blocklist-checked). |
+| `git_push` | `remote` (default `origin`), `branch` | Remote/branch names are validated (`[A-Za-z0-9._/-]+`); argv spawn, no shell. |
+| `git_checkout` | `branch`, `create` (bool) | `create:true` = `checkout -b`. |
+
+Without `--allow-git-write` (also `MUSE_BRIDGE_ALLOW_GIT_WRITE=1` or
+`{"allow_git_write": true}` in config.json) the three write tools are
+not listed and fail with `GIT_WRITE_NOT_ALLOWED` (403). Read git tools
+(`git_status`/`git_diff`/`git_log`/`git_branch`) are unaffected.
+
+### 10.5 Stronger search + local skills (read tools, always on)
+
+| Tool | Args | Notes |
+|---|---|---|
+| `glob_files` | `pattern` (e.g. `**/*.md`), `path`, `max_results` | Glob with `**`/`*`/`?`; respects `.gitignore` + blocklist. |
+| `grep_code` | `pattern` (regex), `path`, `file_glob`, `context_lines`, `case_insensitive` | Regex search; invalid regex → `BAD_ARGS`. |
+| `list_skills` | `project` | Skills found in `skills/`, `.agents/skills/`, `.opencode/skills/` under the root: `{name, path, description, source}`. Description comes from frontmatter `description:` or the first paragraph. |
+| `read_skill` | `name` (or `path`) | Returns the skill's `SKILL.md` content (1 MB cap). Name must match a skill from `list_skills`. |
+
+### 10.6 MCP mode (`--mcp`, stdio JSON-RPC)
+
+`node server.js --mcp [--allow-shell] [--allow-git-write] [--read-only]`
+runs a stdio MCP server instead of the HTTP API: no port is opened,
+nothing but JSON-RPC goes to stdout (logs go to stderr). Supported
+methods: `initialize` (protocol `2024-11-05`), `ping`,
+`tools/list`, `tools/call`, `notifications/*` (ignored). `tools/list`
+exposes exactly the tools the current flags allow; `tools/call`
+dispatches through the same code as the HTTP API, so root scope,
+blocklist, read-only and shell/git-write gates all still apply.
+Stdio is the trust boundary here — no token is checked over stdio,
+because only a local process that launched the server can speak to it.
+
+Example (OpenCode `opencode.json`):
+```json
+{ "mcp": { "muse-bridge": { "type": "local", "command": ["node", "/path/to/muse-ai-local-bridge/server.js", "--mcp", "--allow-shell"], "enabled": true } } }
+```
+
+### 10.7 New error codes (V2)
+
+`SHELL_NOT_ENABLED`, `GIT_WRITE_NOT_ALLOWED`, `TERMINAL_CLOSED`.
+All other V1 codes are unchanged.

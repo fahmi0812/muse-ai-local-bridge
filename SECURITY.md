@@ -57,3 +57,41 @@ doesn't. Read it before exposing a server.
 
 Open a GitHub issue, or email the maintainer privately if it's actively
 exploitable. Please include the commit hash you're running and steps to reproduce.
+
+## V2 additions — read before enabling `--allow-shell` / `--allow-git-write`
+
+V1's guarantees still hold for V1 tools. V2 adds power with an explicit,
+honest trade-off:
+
+- **A shell in the project root can read anything in that root.**
+  The V1 file tools refuse `.env` / `*.key` / `.ssh/` — a bash session
+  does not. `terminal_send "cat .env"` will work. That is the feature
+  (a real terminal is useful precisely because it can do anything) and
+  also the risk. Treat `--allow-shell` like handing someone a terminal:
+  only enable it when the tunnel is private (Tailscale, or a named
+  Cloudflare tunnel with access control), never on a public quick-tunnel
+  URL, and never on a shared machine.
+- **Shell/git-write can only be enabled by the operator who starts the
+  server** — via `--allow-shell` / `--allow-git-write` flags, env vars
+  (`MUSE_BRIDGE_ALLOW_SHELL=1`, `MUSE_BRIDGE_ALLOW_GIT_WRITE=1`), or
+  `allow_shell` / `allow_git_write` in `config.json`. A tool call from
+  chat can never turn them on. `--read-only` overrides all of them.
+- **Scope still holds:** terminals, exec jobs and git commands all run
+  with cwd locked to the project root; path arguments still go through
+  the V1 root resolver + blocklist (file tools, `git_commit --files`).
+  Shell *commands* are not path-checked — that is inherent to a shell.
+- **Audit:** every `terminal_create` / `terminal_send` / `terminal_kill`,
+  `exec_start` / `exec_kill`, `git_commit` / `git_push` / `git_checkout`
+  is appended to `~/.muse-ai-local-bridge/audit.log`, same as V1 writes.
+  Terminal *output* is not logged (it may contain secrets) — only the
+  command text (first 200 chars) is.
+- **No sandbox in v2:** there is no bubblewrap / container around the
+  shell. If you need containment, run the bridge inside a VM/container
+  yourself, or don't enable the shell.
+- **MCP mode (`--mcp`):** stdio is the trust boundary — no token is
+  checked over stdio, because only the local process that launched the
+  server can speak to it. Do not pipe MCP stdio over a network. Root
+  scope, read-only mode, and shell/git-write flags still apply.
+- **Terminal buffers are capped** at 512 KB per terminal / job (oldest
+  output drops); `exec`/`terminal` output is never written to the audit
+  log. Long-running terminals are not auto-killed — kill them when done.

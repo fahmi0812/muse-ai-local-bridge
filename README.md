@@ -1,4 +1,13 @@
-# muse-ai-local-bridge
+# muse-ai-local-bridge — V2 fork
+
+> **Fork note:** this is an unofficial fork (v0.2.0) of
+> [tegarp00/muse-ai-local-bridge](https://github.com/tegarp00/muse-ai-local-bridge)
+> (MIT, v0.1.0). The original MIT license is unchanged (`LICENSE`).
+> V1 behaviour is preserved — every V1 tool works exactly as before.
+> V2 only *adds*: persistent terminals, async exec, opt-in full shell,
+> full git write, glob/regex search, a local skill loader, and a stdio
+> MCP mode. See [PROTOCOL.md §10](PROTOCOL.md) and [SECURITY.md](SECURITY.md)
+> before enabling the shell.
 
 Give Muse AI scoped access to a local project folder — over a plain GET tool API.
 
@@ -74,6 +83,64 @@ with `--new-token`.
 
 Wire details: [PROTOCOL.md](PROTOCOL.md). Threat model: [SECURITY.md](SECURITY.md).
 Stuck? [TROUBLESHOOTING.md](TROUBLESHOOTING.md).
+
+## V2 — powerful mode (opt-in, off by default)
+
+V1 stays the default: allowlist-only `run_command`, no shell. V2 adds
+power, but only when *you* turn it on at startup — a tool call can
+never enable it.
+
+```sh
+cd ~/projects/my-project
+# Full power: persistent bash + long jobs + git commit/push
+mbridge --allow-shell --allow-git-write
+# Or via env / config.json (see config.example.json):
+#   MUSE_BRIDGE_ALLOW_SHELL=1 MUSE_BRIDGE_ALLOW_GIT_WRITE=1 mbridge
+```
+
+New tools (all in `/api/tools/list` when enabled):
+
+| Tool | What it does |
+|---|---|
+| `terminal_create` / `terminal_send` / `terminal_read` / `terminal_kill` (+ `terminal_list`) | One persistent `bash` per project. Send `echo hello\n`, read the buffered output later — for long or interactive-ish work. |
+| `exec_start` / `exec_poll` / `exec_kill` | Long build/test as an async job: start it, poll until `done`, no more waiting on one HTTP call. |
+| `git_branch`, `git_commit`, `git_push`, `git_checkout` | Full git write (commit/push/checkout need `--allow-git-write`). |
+| `glob_files`, `grep_code` | `**/*.md` globs and real regex search, not just literal `search_code`. |
+| `list_skills`, `read_skill` | Read local `SKILL.md` skills from `skills/`, `.agents/skills/`, `.opencode/skills/` in the project — so Muse web can use your local skills like Lumitome does. |
+
+Example — terminal from chat:
+
+```
+terminal_create  →  { id: "term-1" }
+terminal_send { id: "term-1", input: "npm test\n" }
+terminal_read { id: "term-1" }   →  output so far, poll again if still running
+terminal_kill { id: "term-1" }
+```
+
+**Safety rule for V2:** `--allow-shell` means a shell in your project
+root — it *can* read `.env` via the shell and run anything there.
+Only use it behind a private tunnel (Tailscale / named Cloudflare
+tunnel), never a public quick-tunnel URL. `--read-only` still disables
+everything writable, including shell and git write. Full trade-off in
+[SECURITY.md](SECURITY.md).
+
+### V2 — MCP mode (for OpenCode / Claude Desktop)
+
+```sh
+node server.js --mcp --allow-shell --allow-git-write
+```
+
+Stdio JSON-RPC MCP server — no HTTP port, no token over stdio (local
+process only). Add it as a local MCP server in OpenCode
+(`opencode.json`, `mcp.muse-bridge`, `type: local`,
+`command: ["node", "<path>/server.js", "--mcp", "--allow-shell"]`).
+It exposes exactly the tools the flags allow. Details: [PROTOCOL.md §10.6](PROTOCOL.md).
+
+### Tests
+
+```sh
+npm test   # node:test, stdlib only — 10 tests, spawns real servers on temp projects
+```
 
 ## Multiple projects
 
