@@ -10,11 +10,11 @@
   "license": "MIT",
   "name": "muse-ai-local-bridge",
   "scripts": {
-    "test": "node --test test/bridge-v2.test.js"
+    "test": "node --test test/bridge-v2.test.js test/bridge-v3.test.js"
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tegarp00/muse-ai-local-bridge.git"
+    "url": "git+https://github.com/fahmi0812/muse-ai-local-bridge.git"
   },
-  "version": "0.2.0"
+  "version": "0.3.0"
 }

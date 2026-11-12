@@ -100,7 +100,7 @@ test('auth: no token and wrong token are rejected with 401', async () => {
   const good = await fetch(`${srv.base}/api/tools/list`, { headers: { 'X-Api-Key': srv.token } });
   assert.equal(good.status, 200);
   const body = await good.json();
-  assert.equal(body.data.version, '0.2.0');
+  assert.equal(body.data.version, '0.3.0');
   assert.equal(body.data.shell_enabled, true);
 });
 

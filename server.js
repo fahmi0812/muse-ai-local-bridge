@@ -1,15 +1,15 @@
 #!/usr/bin/env node
 /**
- * muse-ai-local-bridge — server (V2, fork)
+ * muse-ai-local-bridge — server (V3, fork)
  *
- * V2 adds, without breaking any V1 tool: persistent terminals,
- * async exec jobs, opt-in full shell (--allow-shell, OFF by default),
- * full git write (gated by --allow-git-write), glob/grep search,
- * a local skill loader, and a stdio MCP mode (--mcp).
- * See PROTOCOL.md section 10 and README.md "V2" for the trade-offs:
- * --allow-shell can run anything in the project root, including
- * reading secrets via the shell — use it only behind a private
- * tunnel (Tailscale / named Cloudflare tunnel), never a public URL.
+ * V3 adds, without breaking any V1/V2 tool: a centralised fail-closed Gate
+ * (lib/gate.js), a bounded ProcessManager with process-group kill
+ * (lib/process-manager.js), a 1-spawn-per-call GitService
+ * (lib/git-service.js), a cached FSService with range reads
+ * (lib/fs-service.js), worker-thread grep/search with timeout
+ * (lib/search.js), and a rotating fail-loud audit log (lib/audit.js).
+ * See PROTOCOL.md section 11 and DESIGN-v3.md for the trade-offs.
+ * PTY / sandbox / streaming are explicitly DEFERRED (see README).
  *
  * Gives an AI client (e.g. Muse at muse.ai) scoped read access to the
  * folder this command runs in, over a GET-based tool API (see PROTOCOL.md).
@@ -32,14 +32,32 @@ const fs = require('node:fs');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
-const { spawn, spawnSync } = require('node:child_process');
+const { spawnSync } = require('node:child_process');
+
+// V3 modules (stdlib only, zero-deps). See lib/*.js.
+const { createGate } = require('./lib/gate.js');
+const { AuditLog } = require('./lib/audit.js');
+const { ProcessManager } = require('./lib/process-manager.js');
+const { GitService, gitRun } = require('./lib/git-service.js');
+const { FSService, readLinesRange } = require('./lib/fs-service.js');
+const { runSearchInWorker } = require('./lib/search.js');
+
+// V3 central services (created once at startup).
+// Gate: fail-closed. MUSE_BRIDGE_GATE_DISABLED=1 exists ONLY so the
+// deletion test can prove write/shell/git refuse without a Gate;
+// there is no way to bypass the Gate, only to make everything fail.
+const gate = createGate({ enabled: process.env.MUSE_BRIDGE_GATE_DISABLED !== '1' });
+const audit = new AuditLog();
+const procManager = new ProcessManager();
+const gitService = new GitService();
+const fsService = new FSService({ isIgnored, isBlocked });
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 
 function printHelp() {
-  console.log(`muse-ai-local-bridge server (V2 fork)
+  console.log(`muse-ai-local-bridge server (V3 fork)
 
 Usage: server.js [options]
        server.js add <folder> | remove <name-or-path> | list
@@ -403,16 +421,10 @@ function resolveInRoot(p, root) {
   return { path: real };
 }
 
-/** Permanent secret blocklist — enforced even inside the root. */
+/** Permanent secret blocklist — enforced even inside the root.
+ *  Single source of truth is Gate.isBlocked (lib/gate.js, extended v3 list). */
 function isBlocked(absPath, root) {
-  const rel = path.relative(root.path, absPath);
-  const parts = rel.split(path.sep);
-  for (const part of parts) {
-    if (part === '.ssh' || part === '.aws' || part === '.gnupg') return true;
-    if (/^\.env(\..+)?$/.test(part) && part !== '.env.example' && part !== '.env.sample') return true;
-    if (part.endsWith('.key') || part.endsWith('.pem')) return true;
-  }
-  return false;
+  return gate.isBlocked(absPath, root.path);
 }
 
 // ---------------------------------------------------------------------------
@@ -488,28 +500,25 @@ function tool_list_files(args) {
   const maxDepth = Math.min(Math.max(parseInt(args.max_depth ?? 3, 10) || 3, 0), 10);
   const recursive = args.recursive !== false;
   const includeHidden = args.include_hidden === true;
-  const out = [];
   const CAP = 2000;
-
-  function walk(dir, depth) {
-    if (out.length >= CAP) return;
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch { return; }
-    entries.sort((a, b) => a.name.localeCompare(b.name));
+  // Filtered result itself is cached (FSService, TTL 2s, invalidated on
+  // write): a cache hit skips the walk AND the per-entry filter loop.
+  const cached = fsService.cachedList(`${root.path}|${r.path}|list|${maxDepth}|${recursive}|${includeHidden}`, () => {
+    const out = [];
+    const entries = fsService.walkRaw(root, r.path, 10000);
     for (const e of entries) {
-      if (out.length >= CAP) return;
-      if (!includeHidden && e.name.startsWith('.')) continue;
-      const abs = path.join(dir, e.name);
-      const rel = path.relative(root.path, abs);
-      const isDir = e.isDirectory();
-      if (isIgnored(rel, isDir, root) || isBlocked(abs, root)) continue;
-      out.push({ path: rel.split(path.sep).join('/'), type: isDir ? 'dir' : 'file' });
-      if (recursive && isDir && depth < maxDepth) walk(abs, depth + 1);
+      if (out.length >= CAP) break;
+      if (e.depth < 0) continue;
+      if (!recursive && e.depth > 0) continue;
+      if (recursive && e.depth > maxDepth) continue;
+      if (!includeHidden && e.relFromStart.split(path.sep).some((s) => s.startsWith('.'))) continue;
+      const relPosix = e.rel.split(path.sep).join('/');
+      if (isIgnored(e.rel, e.isDir, root) || gate.isBlockedRel(relPosix)) continue;
+      out.push({ path: relPosix, type: e.isDir ? 'dir' : 'file' });
     }
-  }
-  walk(r.path, 0);
-  return { path: path.relative(root.path, r.path).split(path.sep).join('/') || '.', files: out, truncated: out.length >= CAP };
+    return { files: out, truncated: out.length >= CAP };
+  });
+  return { path: path.relative(root.path, r.path).split(path.sep).join('/') || '.', files: cached.files, truncated: cached.truncated };
 }
 
 function tool_read_file(args) {
@@ -527,22 +536,27 @@ function tool_read_file(args) {
   if (st.isDirectory()) return { error: 'BAD_ARGS', message: 'path is a directory' };
   const MAX_BYTES = 1024 * 1024; // ~1 MB per call
   if (st.size > MAX_BYTES) return { error: 'BAD_ARGS', message: `file too large (${st.size} bytes, max ${MAX_BYTES})` };
-  const buf = fs.readFileSync(r.path);
-  if (isBinary(buf.subarray(0, 8000))) return { error: 'BAD_ARGS', message: 'file looks binary' };
-  const lines = buf.toString('utf8').split('\n');
+  // Binary check on the first 8 KB only (no full read).
+  const fd0 = fs.openSync(r.path, 'r');
+  try {
+    const head = Buffer.alloc(8000);
+    const n = fs.readSync(fd0, head, 0, 8000, 0);
+    if (isBinary(head.subarray(0, n))) return { error: 'BAD_ARGS', message: 'file looks binary' };
+  } finally { fs.closeSync(fd0); }
+  // NOTE: offset is 0-based (PROTOCOL.md §6, fixed in v3 to match the code).
   const offset = Math.max(parseInt(args.offset ?? 0, 10) || 0, 0);
   const limit = Math.min(Math.max(parseInt(args.limit ?? 200, 10) || 200, 1), 2000);
-  const slice = lines.slice(offset, offset + limit);
+  const { content, totalLines } = readLinesRange(r.path, offset, limit);
   return {
     path: path.relative(root.path, r.path).split(path.sep).join('/'),
-    total_lines: lines.length,
+    total_lines: totalLines,
     offset,
-    content: slice.join('\n'),
-    truncated: offset + limit < lines.length,
+    content,
+    truncated: offset + limit < totalLines,
   };
 }
 
-function tool_search_code(args) {
+async function tool_search_code(args) {
   if (!args.pattern || typeof args.pattern !== 'string') {
     return { error: 'BAD_ARGS', message: 'pattern is required (e.g. ?tool=search_code&pattern=TODO)' };
   }
@@ -557,92 +571,56 @@ function tool_search_code(args) {
   const fileGlob = args.file_glob || null;
   const contextLines = Math.min(Math.max(parseInt(args.context_lines ?? 2, 10) || 0, 0), 5);
   const globRe = fileGlob ? new RegExp('^' + fileGlob.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$') : null;
-  const matches = [];
-  const CAP_FILES = 5000, CAP_MATCHES = 200;
-  let filesSeen = 0;
-
-  function walk(dir) {
-    if (matches.length >= CAP_MATCHES || filesSeen >= CAP_FILES) return;
-    let entries;
-    try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
-    catch { return; }
-    for (const e of entries) {
-      if (matches.length >= CAP_MATCHES || filesSeen >= CAP_FILES) return;
-      if (e.name.startsWith('.') && e.name !== '.') {
-        // still descend into non-ignored dot dirs? No — keep it simple, skip hidden.
-        continue;
-      }
-      const abs = path.join(dir, e.name);
-      const rel = path.relative(root.path, abs);
-      const isDir = e.isDirectory();
-      if (isIgnored(rel, isDir, root) || isBlocked(abs, root)) continue;
-      if (isDir) { walk(abs); continue; }
-      if (globRe && !globRe.test(e.name)) continue;
-      filesSeen++;
-      let buf;
-      try {
-        const st = fs.statSync(abs);
-        if (st.size > 1024 * 1024) continue;
-        buf = fs.readFileSync(abs);
-      } catch { continue; }
-      if (isBinary(buf.subarray(0, 8000))) continue;
-      const lines = buf.toString('utf8').split('\n');
-      for (let i = 0; i < lines.length && matches.length < CAP_MATCHES; i++) {
-        if (lines[i].includes(pattern)) {
-          const start = Math.max(0, i - contextLines);
-          const end = Math.min(lines.length, i + contextLines + 1);
-          matches.push({
-            path: rel.split(path.sep).join('/'),
-            line: i + 1,
-            context: lines.slice(start, end).join('\n'),
-          });
-        }
-      }
-    }
-  }
+  const CAP_MATCHES = 200;
 
   const startStat = fs.statSync(r.path);
-  if (startStat.isDirectory()) walk(r.path);
-  else {
-    // single file search
+  if (!startStat.isDirectory()) {
+    // Single file (RC6): size + binary check BEFORE any read.
+    try { gate.validateSize(startStat.size); } catch (e) { return { error: e.code || 'BAD_ARGS', message: e.message }; }
     const rel = path.relative(root.path, r.path);
-    if (!isIgnored(rel, false, root)) {
-      const lines = fs.readFileSync(r.path, 'utf8').split('\n');
-      for (let i = 0; i < lines.length && matches.length < CAP_MATCHES; i++) {
-        if (lines[i].includes(pattern)) matches.push({ path: rel.split(path.sep).join('/'), line: i + 1, context: lines[i] });
-      }
+    if (isIgnored(rel, false, root)) return { pattern, matches: [], truncated: false };
+    const buf = fs.readFileSync(r.path);
+    if (isBinary(buf.subarray(0, 8000))) return { error: 'BAD_ARGS', message: 'file looks binary' };
+    const lines = buf.toString('utf8').split('\n');
+    const matches = [];
+    for (let i = 0; i < lines.length && matches.length < CAP_MATCHES; i++) {
+      if (lines[i].includes(pattern)) matches.push({ path: rel.split(path.sep).join('/'), line: i + 1, context: lines[i] });
     }
+    return { pattern, matches, truncated: matches.length >= CAP_MATCHES };
   }
-  return { pattern, matches, truncated: matches.length >= CAP_MATCHES };
+
+  // Directory: cached walk for the file list, matching in a worker thread.
+  const entries = fsService.walkRaw(root, r.path, 5000);
+  const files = [];
+  for (const e of entries) {
+    if (e.isDir) continue;
+    if (files.length >= 5000) break;
+    if (e.relFromStart.split(path.sep).some((s) => s.startsWith('.'))) continue;
+    if (isIgnored(e.rel, false, root) || gate.isBlockedRel(e.rel.split(path.sep).join('/'))) continue;
+    if (globRe && !globRe.test(e.name)) continue;
+    files.push({ abs: e.abs, rel: e.rel.split(path.sep).join('/') });
+  }
+  const res = await runSearchInWorker({ files, pattern, isRegex: false, flags: '', contextLines, cap: CAP_MATCHES });
+  if (res.error) {
+    if (res.timeout) return { error: 'TIMEOUT', message: 'search timed out after 2s' };
+    return { error: 'INTERNAL_ERROR', message: res.error };
+  }
+  return { pattern, matches: res.matches, truncated: res.truncated };
 }
 
 // ---------------------------------------------------------------------------
 // git helpers — spawned with argv arrays, never through a shell
 // ---------------------------------------------------------------------------
 
-function gitIsRepo(root) {
-  const r = spawnSync('git', ['rev-parse', '--is-inside-work-tree'], { cwd: root.path, encoding: 'utf8', timeout: 10000 });
-  return r.status === 0;
-}
-
-function gitRun(gitArgs, root, timeoutMs = 15000) {
-  const r = spawnSync('git', gitArgs, { cwd: root.path, encoding: 'utf8', timeout: timeoutMs, maxBuffer: 4 * 1024 * 1024 });
-  return r;
-}
+// gitRun comes from lib/git-service.js (argv spawn, never a shell).
+function gitIsRepo(root) { return gitService.isRepo(root); }
 
 function tool_git_status(args) {
   const sel = selectRoot(args);
   if (sel.error) return sel;
   const root = sel.root;
   if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
-  const r = gitRun(['status', '--porcelain=v1', '--untracked-files=normal'], root);
-  if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: (r.stderr || 'git status failed').trim() };
-  const files = r.stdout.split('\n').filter(Boolean).map(line => ({
-    status: line.slice(0, 2).trim() || '?',
-    path: line.slice(3).trim(),
-  }));
-  const branch = gitRun(['rev-parse', '--abbrev-ref', 'HEAD'], root);
-  return { branch: branch.status === 0 ? branch.stdout.trim() : null, files };
+  return gitService.status(root); // 1 spawn: 'status --porcelain=v1 -b'
 }
 
 function tool_git_diff(args) {
@@ -650,8 +628,7 @@ function tool_git_diff(args) {
   if (sel.error) return sel;
   const root = sel.root;
   if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
-  const gitArgs = ['diff', '--no-color'];
-  if (args.staged) gitArgs.push('--cached');
+  const gitArgs = gate.validateArgv(['diff', '--no-color'], args.staged ? ['--cached'] : [], { allowFlags: ['--cached'] });
   if (args.path) {
     const r = resolveInRoot(args.path, root);
     if (r.error) return { error: r.error, message: r.message };
@@ -682,16 +659,10 @@ function tool_git_log(args) {
 // Audit log — append-only record of every write and command (PROTOCOL.md 8)
 // ---------------------------------------------------------------------------
 
-function auditLog(tool, target, result) {
-  try {
-    const dir = path.join(os.homedir(), '.muse-ai-local-bridge');
-    fs.mkdirSync(dir, { recursive: true });
-    const line = `${new Date().toISOString()}\t${tool}\t${target}\t${result}\n`;
-    fs.appendFileSync(path.join(dir, 'audit.log'), line);
-  } catch {
-    // Audit must never break the tool it records.
-  }
-}
+// Audit log (v3): rotation 10 MB keep 3, fail-loud (stderr + degraded flag).
+// Contract: callers NEVER pass terminal input / file contents here —
+// only ids, paths and lengths. See lib/audit.js.
+function auditLog(tool, target, result) { audit.log(tool, target, result); }
 
 /** Atomic write: temp file in the same directory, then rename. */
 function atomicWrite(absPath, content) {
@@ -755,6 +726,7 @@ function tool_write_file(args) {
     return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` };
   }
   const relPath = path.relative(root.path, abs).split(path.sep).join('/');
+  fsService.invalidate(root.path);
   auditLog('write_file', relPath, 'ok');
   return { path: relPath, bytes_written: Buffer.byteLength(args.content, 'utf8') };
 }
@@ -785,6 +757,7 @@ function tool_edit_file(args) {
   try { atomicWrite(r.path, next); }
   catch (e) { return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` }; }
   const relPath = path.relative(root.path, r.path).split(path.sep).join('/');
+  fsService.invalidate(root.path);
   auditLog('edit_file', relPath, 'ok');
   return { path: relPath, bytes_written: Buffer.byteLength(next, 'utf8') };
 }
@@ -865,6 +838,7 @@ function tool_apply_patch(args) {
   try { atomicWrite(r.path, next); }
   catch (e) { return { error: 'WRITE_ATOMIC_FAILED', message: `write failed: ${e.message}` }; }
   const relPath = path.relative(root.path, r.path).split(path.sep).join('/');
+  fsService.invalidate(root.path);
   auditLog('apply_patch', relPath, `${hunks.length} hunks ok`);
   return { path: relPath, hunks_applied: hunks.length };
 }
@@ -935,46 +909,43 @@ function tool_run_command(args) {
 // (see the registry below); read tools are always available.
 // ---------------------------------------------------------------------------
 
-const TERMINALS = new Map(); // id -> {id, child, root, buffer, exitCode, createdAt}
-let termSeq = 0;
-const TERM_BUF_MAX = 512 * 1024;
-function termAppend(t, chunk) {
-  t.buffer += chunk;
-  if (t.buffer.length > TERM_BUF_MAX) t.buffer = t.buffer.slice(t.buffer.length - TERM_BUF_MAX);
-}
+// --- terminals + exec jobs (v3): bounded ProcessManager, group kill ---
+// TERMINALS/JOBS Maps are gone (RC3/RC4). procManager caps terminals at 8
+// and jobs at 16 (env-overridable), evicts finished ones LRU, kills idle
+// terminals after 30 min, and kills whole process groups (detached:true).
 function tool_terminal_create(args) {
   const g = shellGate(); if (g) return g;
   const sel = selectRoot(args); if (sel.error) return sel;
-  const id = `term-${++termSeq}`;
-  const child = spawn('bash', [], { cwd: sel.root.path, env: { ...process.env, TERM: 'xterm-256color' } });
-  const t = { id, child, root: sel.root, buffer: '', exitCode: null, createdAt: new Date().toISOString() };
-  child.stdout.on('data', (d) => termAppend(t, d.toString('utf8')));
-  child.stderr.on('data', (d) => termAppend(t, d.toString('utf8')));
-  child.on('exit', (code) => { t.exitCode = code; });
-  child.on('error', (e) => { t.exitCode = -1; termAppend(t, `\n[terminal spawn error: ${e.message}]\n`); });
-  TERMINALS.set(id, t);
-  auditLog('terminal_create', `${id} in ${sel.root.path}`, 'ok');
-  return { id, project: sel.root.name, pid: child.pid, running: true };
+  let t;
+  try {
+    t = procManager.createTerminal({ cwd: sel.root.path, env: { ...process.env, TERM: 'xterm-256color' } });
+  } catch (e) {
+    return { error: e.code || 'INTERNAL_ERROR', message: e.message };
+  }
+  t.root = sel.root;
+  auditLog('terminal_create', `${t.id} in ${sel.root.path}`, 'ok');
+  return { id: t.id, project: sel.root.name, pid: t.child.pid, running: true };
 }
 function tool_terminal_list() {
   const g = shellGate(); if (g) return g;
-  return { terminals: [...TERMINALS.values()].map((t) => ({ id: t.id, project: t.root.name, pid: t.child.pid, running: t.exitCode === null, exit_code: t.exitCode, buffered_bytes: t.buffer.length })) };
+  return { terminals: [...procManager.terminals.values()].map((t) => ({ id: t.id, project: t.root ? t.root.name : '?', pid: t.child.pid, running: t.exitCode === null, exit_code: t.exitCode, buffered_bytes: t.buffer.length })) };
 }
 function tool_terminal_send(args) {
   const g = shellGate(); if (g) return g;
   if (!args.id || typeof args.id !== 'string') return { error: 'BAD_ARGS', message: 'id is required (from terminal_create)' };
   if (typeof args.input !== 'string') return { error: 'BAD_ARGS', message: 'input is required (include a trailing newline to run it)' };
-  const t = TERMINALS.get(args.id);
+  const t = procManager.getTerminal(args.id);
   if (!t) return { error: 'BAD_ARGS', message: `unknown terminal: ${args.id}` };
   if (t.exitCode !== null) return { error: 'TERMINAL_CLOSED', message: `terminal ${args.id} already exited (${t.exitCode})` };
-  try { t.child.stdin.write(args.input); } catch (e) { return { error: 'INTERNAL_ERROR', message: e.message }; }
-  auditLog('terminal_send', args.id, args.input.slice(0, 200).replace(/\n/g, '\\n'));
+  try { procManager.sendTerminal(args.id, args.input); } catch (e) { return { error: 'INTERNAL_ERROR', message: e.message }; }
+  // NEVER log the input itself — only the id + byte count (RC: audit secret).
+  auditLog('terminal_send', args.id, `${Buffer.byteLength(args.input, 'utf8')} bytes`);
   return { id: args.id, sent_bytes: Buffer.byteLength(args.input, 'utf8') };
 }
 function tool_terminal_read(args) {
   const g = shellGate(); if (g) return g;
   if (!args.id || typeof args.id !== 'string') return { error: 'BAD_ARGS', message: 'id is required' };
-  const t = TERMINALS.get(args.id);
+  const t = procManager.getTerminal(args.id);
   if (!t) return { error: 'BAD_ARGS', message: `unknown terminal: ${args.id}` };
   const offset = Math.max(parseInt(args.offset ?? 0, 10) || 0, 0);
   return { id: args.id, output: t.buffer.slice(offset), offset: t.buffer.length, running: t.exitCode === null, exit_code: t.exitCode };
@@ -982,51 +953,37 @@ function tool_terminal_read(args) {
 function tool_terminal_kill(args) {
   const g = shellGate(); if (g) return g;
   if (!args.id || typeof args.id !== 'string') return { error: 'BAD_ARGS', message: 'id is required' };
-  const t = TERMINALS.get(args.id);
-  if (!t) return { error: 'BAD_ARGS', message: `unknown terminal: ${args.id}` };
-  try { t.child.kill('SIGTERM'); } catch { /* already dead */ }
-  TERMINALS.delete(args.id);
+  if (!procManager.killTerminal(args.id, 'SIGTERM')) return { error: 'BAD_ARGS', message: `unknown terminal: ${args.id}` };
   auditLog('terminal_kill', args.id, 'ok');
   return { id: args.id, killed: true };
 }
 
 // --- async exec jobs ---
-const JOBS = new Map();
-let jobSeq = 0;
 function tool_exec_start(args) {
   const g = shellGate(); if (g) return g;
   if (!args.command || typeof args.command !== 'string') return { error: 'BAD_ARGS', message: 'command is required' };
   const sel = selectRoot(args); if (sel.error) return sel;
   const cmd = args.command.trim();
-  let child;
-  if (opts.allowShell) {
-    child = spawn('bash', ['-c', cmd], { cwd: sel.root.path });
-  } else {
-    // Unreachable when the registry is built correctly (tool hidden when
-    // shell is off), but keep the allowlist path as a defence in depth.
+  if (!opts.allowShell) {
+    // Defence in depth (registry already hides this tool when shell is off).
     if (METACHAR.test(cmd)) return { error: 'COMMAND_REJECTED_METACHAR', message: 'command contains shell metacharacters' };
     if (!ALLOWLIST.includes(cmd)) return { error: 'COMMAND_NOT_ALLOWED', message: `command not on the allowlist: ${cmd}` };
-    const argv = cmd.split(/\s+/);
-    child = spawn(argv[0], argv.slice(1), { cwd: sel.root.path });
   }
   const timeoutMs = Math.min(Math.max((parseInt(args.timeout_s ?? 600, 10) || 600), 1), 1800) * 1000;
-  const id = `job-${++jobSeq}`;
-  const job = { id, child, command: cmd, output: '', exitCode: null, status: 'running', startedAt: new Date().toISOString() };
-  child.stdout.on('data', (d) => { job.output += d.toString('utf8'); if (job.output.length > 512 * 1024) job.output = job.output.slice(-512 * 1024); });
-  child.stderr.on('data', (d) => { job.output += d.toString('utf8'); if (job.output.length > 512 * 1024) job.output = job.output.slice(-512 * 1024); });
-  child.on('exit', (code) => { if (job.status === 'running') { job.status = 'done'; job.exitCode = code; } });
-  child.on('error', (e) => { job.status = 'done'; job.exitCode = -1; job.output += `\n[spawn error: ${e.message}]\n`; });
-  job.timer = setTimeout(() => { if (job.status === 'running') { job.status = 'timeout'; try { child.kill('SIGKILL'); } catch {} } }, timeoutMs);
-  if (job.timer.unref) job.timer.unref();
-  JOBS.set(id, job);
-  auditLog('exec_start', id, cmd.slice(0, 200));
-  return { job_id: id, status: 'running', command: cmd };
+  let job;
+  try {
+    job = procManager.startJob({ command: cmd, cwd: sel.root.path, useShell: opts.allowShell, timeoutMs });
+  } catch (e) {
+    return { error: e.code || 'INTERNAL_ERROR', message: e.message };
+  }
+  auditLog('exec_start', job.id, `${cmd.length} bytes`);
+  return { job_id: job.id, status: 'running', command: cmd };
 }
 function tool_exec_poll(args) {
   const g = shellGate(); if (g) return g;
   const id = args.job_id || args.id;
   if (!id || typeof id !== 'string') return { error: 'BAD_ARGS', message: 'job_id is required (from exec_start)' };
-  const job = JOBS.get(id);
+  const job = procManager.getJob(id);
   if (!job) return { error: 'BAD_ARGS', message: `unknown job: ${id}` };
   return { job_id: id, status: job.status, exit_code: job.exitCode, output: job.output, truncated: job.output.length >= 512 * 1024 };
 }
@@ -1034,9 +991,8 @@ function tool_exec_kill(args) {
   const g = shellGate(); if (g) return g;
   const id = args.job_id || args.id;
   if (!id || typeof id !== 'string') return { error: 'BAD_ARGS', message: 'job_id is required' };
-  const job = JOBS.get(id);
+  const job = procManager.killJob(id);
   if (!job) return { error: 'BAD_ARGS', message: `unknown job: ${id}` };
-  if (job.status === 'running') { job.status = 'killed'; try { job.child.kill('SIGKILL'); } catch {} clearTimeout(job.timer); }
   auditLog('exec_kill', id, job.status);
   return { job_id: id, status: job.status, killed: true };
 }
@@ -1056,67 +1012,59 @@ function globToRegExp(glob) {
   }
   return new RegExp('^' + re + '$');
 }
-function walkFiles(root, startAbs, onFile, cap) {
-  let seen = 0;
-  function walk(dir) {
-    if (seen >= cap) return;
-    let entries; try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
-    for (const e of entries) {
-      if (seen >= cap) return;
-      if (e.name.startsWith('.') && e.name !== '.') continue;
-      const abs = path.join(dir, e.name);
-      const rel = path.relative(root.path, abs);
-      const isDir = e.isDirectory();
-      if (isIgnored(rel, isDir, root) || isBlocked(abs, root)) continue;
-      if (isDir) { walk(abs); continue; }
-      seen++;
-      onFile(abs, rel);
-    }
-  }
-  const st = fs.statSync(startAbs);
-  if (st.isDirectory()) walk(startAbs);
-  else onFile(startAbs, path.relative(root.path, startAbs));
-}
 function tool_glob_files(args) {
   if (!args.pattern || typeof args.pattern !== 'string') return { error: 'BAD_ARGS', message: 'pattern is required (e.g. **/*.md)' };
+  if (args.pattern.length > 200) return { error: 'BAD_ARGS', message: 'pattern too long (max 200 chars)' };
+  if ((args.pattern.match(/\*\*/g) || []).length > 4) return { error: 'BAD_ARGS', message: 'pattern has too many ** segments (max 4)' };
   const sel = selectRoot(args); if (sel.error) return sel;
   const root = sel.root;
   const r = resolveInRoot(args.path || '.', root); if (r.error) return { error: r.error, message: r.message };
   const re = globToRegExp(args.pattern);
   const maxResults = Math.min(Math.max(parseInt(args.max_results ?? 500, 10) || 500, 1), 2000);
   const out = [];
-  walkFiles(root, r.path, (abs, rel) => {
-    if (out.length >= maxResults) return;
-    const relPosix = rel.split(path.sep).join('/');
+  for (const e of fsService.walkRaw(root, r.path, 5000)) {
+    if (out.length >= maxResults) break;
+    if (e.isDir) continue;
+    if (e.relFromStart.split(path.sep).some((s) => s.startsWith('.'))) continue;
+    if (isIgnored(e.rel, false, root) || gate.isBlockedRel(e.rel.split(path.sep).join('/'))) continue;
+    const relPosix = e.rel.split(path.sep).join('/');
     if (re.test(relPosix) || (!args.pattern.includes('/') && re.test(path.basename(relPosix)))) out.push(relPosix);
-  }, 5000);
+  }
   return { pattern: args.pattern, files: out.sort(), truncated: out.length >= maxResults };
 }
-function tool_grep_code(args) {
+async function tool_grep_code(args) {
   if (!args.pattern || typeof args.pattern !== 'string') return { error: 'BAD_ARGS', message: 'pattern is required (regex)' };
-  let re;
-  try { re = new RegExp(args.pattern, args.case_insensitive === true ? 'i' : ''); }
-  catch (e) { return { error: 'BAD_ARGS', message: `invalid regex: ${e.message}` }; }
+  // Gate (RC5): length cap + nested-quantifier rejection, before any work.
+  gate.validateRegex(args.pattern);
   const sel = selectRoot(args); if (sel.error) return sel;
   const root = sel.root;
   const r = resolveInRoot(args.path || '.', root); if (r.error) return { error: r.error, message: r.message };
   const contextLines = Math.min(Math.max(parseInt(args.context_lines ?? 2, 10) || 0, 0), 5);
   const fileGlob = args.file_glob ? globToRegExp(args.file_glob) : null;
-  const matches = []; const CAP = 200;
-  walkFiles(root, r.path, (abs, rel) => {
-    if (matches.length >= CAP) return;
-    if (fileGlob && !fileGlob.test(path.basename(abs))) return;
-    let buf; try { const st = fs.statSync(abs); if (st.size > 1024 * 1024) return; buf = fs.readFileSync(abs); } catch { return; }
-    if (isBinary(buf.subarray(0, 8000))) return;
-    const lines = buf.toString('utf8').split('\n');
-    for (let i = 0; i < lines.length && matches.length < CAP; i++) {
-      if (re.test(lines[i])) {
-        const start = Math.max(0, i - contextLines), end = Math.min(lines.length, i + contextLines + 1);
-        matches.push({ path: rel.split(path.sep).join('/'), line: i + 1, context: lines.slice(start, end).join('\n') });
-      }
-    }
-  }, 5000);
-  return { pattern: args.pattern, matches, truncated: matches.length >= CAP };
+  const files = [];
+  for (const e of fsService.walkRaw(root, r.path, 5000)) {
+    if (e.isDir) continue;
+    if (files.length >= 5000) break;
+    if (e.relFromStart.split(path.sep).some((s) => s.startsWith('.'))) continue;
+    if (isIgnored(e.rel, false, root) || gate.isBlockedRel(e.rel.split(path.sep).join('/'))) continue;
+    if (fileGlob && !fileGlob.test(path.basename(e.abs))) continue;
+    files.push({ abs: e.abs, rel: e.rel.split(path.sep).join('/') });
+  }
+  // Single-file path: same worker, same timeout (no special-casing).
+  if (!fs.statSync(r.path).isDirectory()) {
+    try { gate.validateSize(fs.statSync(r.path).size); } catch (e) { return { error: e.code || 'BAD_ARGS', message: e.message }; }
+    files.length = 0;
+    files.push({ abs: r.path, rel: path.relative(root.path, r.path).split(path.sep).join('/') });
+  }
+  const res = await runSearchInWorker({
+    files, pattern: args.pattern, isRegex: true,
+    flags: args.case_insensitive === true ? 'i' : '', contextLines, cap: 200,
+  });
+  if (res.error) {
+    if (res.timeout) return { error: 'TIMEOUT', message: 'grep timed out after 2s' };
+    return { error: 'INTERNAL_ERROR', message: res.error };
+  }
+  return { pattern: args.pattern, matches: res.matches, truncated: res.truncated };
 }
 
 // --- local skill loader (skills/ + .agents/skills/ + .opencode/skills/) ---
@@ -1165,16 +1113,12 @@ function tool_read_skill(args) {
   return { name: hit.name, path: hit.path, content };
 }
 
-// --- full git (write side gated by --allow-git-write) ---
-const GIT_REF_RE = /^[A-Za-z0-9._\/-]+$/;
+// --- full git (write side gated by --allow-git-write; refs via lib/gate.js) ---
 function tool_git_branch(args) {
   const sel = selectRoot(args); if (sel.error) return sel;
   const root = sel.root;
   if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
-  const r = gitRun(['branch', '--format=%(refname:short)'], root);
-  if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: (r.stderr || 'git branch failed').trim() };
-  const cur = gitRun(['rev-parse', '--abbrev-ref', 'HEAD'], root);
-  return { current: cur.status === 0 ? cur.stdout.trim() : null, branches: r.stdout.split('\n').filter(Boolean) };
+  return gitService.branch(root); // 1 spawn + current branch from .git/HEAD
 }
 function tool_git_commit(args) {
   const g = gitWriteGate(); if (g) return g;
@@ -1184,16 +1128,30 @@ function tool_git_commit(args) {
   const root = sel.root;
   if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
   if (args.all === true) {
-    const a = gitRun(['add', '-A'], root); if (a.status !== 0) return { error: 'INTERNAL_ERROR', message: (a.stderr || 'git add failed').trim() };
-  } else if (Array.isArray(args.files) && args.files.length) {
-    const absFiles = [];
-    for (const f of args.files) {
-      if (typeof f !== 'string') return { error: 'BAD_ARGS', message: 'files must be strings' };
-      const rr = resolveInRoot(f, root); if (rr.error) return { error: rr.error, message: rr.message };
-      if (isBlocked(rr.path, root)) return { error: 'FILE_BLOCKED', message: 'path is on the secret blocklist' };
-      absFiles.push(rr.path);
+    // RC2: NEVER `git add -A` raw. Enumerate stageable files, filter each
+    // through the same Gate blocklist as the `files:` path, then add only
+    // the survivors (explicit '--' before the paths).
+    const listed = gitService.listStageable(root);
+    if (listed.error) return listed;
+    const filtered = [];
+    for (const f of listed.files) {
+      if (typeof f !== 'string') continue;
+      if (isBlocked(path.join(root.path, f), root)) continue; // secret: skip, don't stage
+      const rr = resolveInRoot(f, root);
+      if (!rr.error) { filtered.push(rr.path); continue; }
+      // Deleted tracked file: not on disk any more, but `git add -- <path>`
+      // still stages the deletion. Only for files git itself lists.
+      if (rr.error === 'PATH_NOT_FOUND' && listed.tracked.includes(f)) filtered.push(path.join(root.path, f));
+      else if (rr.error !== 'PATH_NOT_FOUND') return { error: rr.error, message: rr.message };
     }
-    const a = gitRun(['add', '--', ...absFiles], root); if (a.status !== 0) return { error: 'INTERNAL_ERROR', message: (a.stderr || 'git add failed').trim() };
+    if (filtered.length) {
+      const a = gitRun(gate.validateArgv(['add'], filtered), root);
+      if (a.status !== 0) return { error: 'INTERNAL_ERROR', message: (a.stderr || 'git add failed').trim() };
+    }
+  } else if (Array.isArray(args.files) && args.files.length) {
+    const absFiles = gate.validatePaths(args.files, { root, resolve: resolveInRoot });
+    const a = gitRun(gate.validateArgv(['add'], absFiles), root);
+    if (a.status !== 0) return { error: 'INTERNAL_ERROR', message: (a.stderr || 'git add failed').trim() };
   }
   const c = gitRun(['commit', '-m', args.message.trim()], root, 30000);
   if (c.status !== 0) return { error: 'INTERNAL_ERROR', message: (c.stderr || c.stdout || 'git commit failed').trim().slice(0, 2000) };
@@ -1207,8 +1165,11 @@ function tool_git_push(args) {
   const root = sel.root;
   if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
   const remote = args.remote || 'origin', branch = args.branch || null;
-  if (!GIT_REF_RE.test(remote) || (branch && !GIT_REF_RE.test(branch))) return { error: 'BAD_ARGS', message: 'invalid remote/branch name' };
-  const gitArgs = ['push', remote]; if (branch) gitArgs.push(branch);
+  // RC1: refs must not start with '-' and go after '--', so '--force' etc.
+  // can never be parsed as a git option.
+  gate.validateRef(remote);
+  if (branch) gate.validateRef(branch);
+  const gitArgs = gate.validateArgv(['push'], branch ? [remote, branch] : [remote]);
   const r = gitRun(gitArgs, root, 120000);
   if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: ((r.stderr || r.stdout || 'git push failed').trim().slice(0, 2000)) };
   auditLog('git_push', root.path, `${remote}${branch ? ' ' + branch : ''}`);
@@ -1216,10 +1177,14 @@ function tool_git_push(args) {
 }
 function tool_git_checkout(args) {
   const g = gitWriteGate(); if (g) return g;
-  if (!args.branch || typeof args.branch !== 'string' || !GIT_REF_RE.test(args.branch)) return { error: 'BAD_ARGS', message: 'branch is required (letters, digits, . _ / - only)' };
+  if (!args.branch || typeof args.branch !== 'string') return { error: 'BAD_ARGS', message: 'branch is required (letters, digits, . _ / - only)' };
+  gate.validateRef(args.branch);
   const sel = selectRoot(args); if (sel.error) return sel;
   const root = sel.root;
   if (!gitIsRepo(root)) return { error: 'BAD_ARGS', message: 'not a git repository' };
+  // '-b' is an internal flag (branch itself is Gate-validated, no leading '-').
+  // NOTE: no '--' here — `git checkout -- <branch>` would treat the branch
+  // as a *pathspec* (file), not a revision. Safety comes from validateRef.
   const gitArgs = args.create === true ? ['checkout', '-b', args.branch] : ['checkout', args.branch];
   const r = gitRun(gitArgs, root, 30000);
   if (r.status !== 0) return { error: 'INTERNAL_ERROR', message: ((r.stderr || 'git checkout failed').trim().slice(0, 2000)) };
@@ -1320,8 +1285,11 @@ const V2_GIT_WRITE_TOOLS = {
 const ALL_TOOLS = opts.readOnly ? READ_TOOLS
   : { ...READ_TOOLS, ...WRITE_TOOLS, ...(SHELL_ENABLED ? V2_SHELL_TOOLS : {}), ...(GIT_WRITE_ENABLED ? V2_GIT_WRITE_TOOLS : {}) };
 const KNOWN_TOOLS = new Set([...Object.keys(READ_TOOLS), ...Object.keys(WRITE_TOOLS), ...Object.keys(V2_SHELL_TOOLS), ...Object.keys(V2_GIT_WRITE_TOOLS)]);
+// Error codes the Gate / services may throw; dispatch maps them verbatim
+// instead of hiding them behind INTERNAL_ERROR.
+const THROWN_CODES = new Set(['BAD_ARGS', 'FILE_BLOCKED', 'PATH_OUTSIDE_ROOT', 'PATH_NOT_FOUND', 'GATE_DISABLED', 'RESOURCE_EXHAUSTED', 'TIMEOUT']);
 /** Shared dispatch for HTTP and MCP: returns {data} or {error, message}. */
-function dispatchTool(name, args) {
+async function dispatchTool(name, args) {
   const tool = ALL_TOOLS[name];
   if (!tool) {
     if (Object.keys(V2_SHELL_TOOLS).includes(name)) return { error: opts.readOnly ? 'MODE_READ_ONLY' : 'SHELL_NOT_ENABLED', message: opts.readOnly ? 'server is in read-only mode' : 'full shell is off — restart with --allow-shell' };
@@ -1329,11 +1297,18 @@ function dispatchTool(name, args) {
     if (Object.keys(WRITE_TOOLS).includes(name)) return { error: 'MODE_READ_ONLY', message: `tool "${name}" is not available in read-only mode` };
     return { error: 'UNKNOWN_TOOL', message: `unknown tool: ${name} (see /api/tools/list)` };
   }
+  // Deletion test (fail-closed): without a Gate, write/shell/git refuse.
+  if (!gate.enabled && (name in WRITE_TOOLS || name in V2_SHELL_TOOLS || name in V2_GIT_WRITE_TOOLS)) {
+    return { error: 'GATE_DISABLED', message: 'Gate is disabled — write/shell/git tools refuse to run (fail-closed)' };
+  }
   try {
-    const result = tool.fn(args || {});
+    const result = await tool.fn(args || {});
     if (result && result.error) return { error: result.error, message: result.message || result.error };
     return { data: result };
   } catch (e) {
+    if (e && typeof e.code === 'string' && THROWN_CODES.has(e.code)) {
+      return { error: e.code, message: e.message || e.code };
+    }
     return { error: 'INTERNAL_ERROR', message: `tool crashed: ${e.message}` };
   }
 }
@@ -1341,7 +1316,7 @@ function dispatchTool(name, args) {
 function serveToolsList(res) {
   ok(res, {
     mode: opts.readOnly ? 'read-only' : 'read-write',
-    version: '0.2.0',
+    version: '0.3.0',
     shell_enabled: SHELL_ENABLED,
     git_write_enabled: GIT_WRITE_ENABLED,
     project_roots: getRoots().map(r => r.path),
@@ -1367,7 +1342,7 @@ function coerceFlatValue(v) {
   return v;
 }
 
-function handleCall(url, res) {
+async function handleCall(url, res) {
   const name = url.searchParams.get('tool');
   const rawArgs = url.searchParams.get('args') || '{}';
   if (!name) return fail(res, 400, 'BAD_ARGS', 'missing tool parameter');
@@ -1384,11 +1359,14 @@ function handleCall(url, res) {
     flat[k] = coerceFlatValue(v);
   }
   args = { ...flat, ...args };
-  const out = dispatchTool(name, args);
+  const out = await dispatchTool(name, args);
   if (out.error) {
     const status = out.error === 'PATH_OUTSIDE_ROOT' || out.error === 'FILE_BLOCKED' || out.error === 'SHELL_NOT_ENABLED' || out.error === 'GIT_WRITE_NOT_ALLOWED' ? 403
       : out.error === 'PATH_NOT_FOUND' ? 404
       : out.error === 'MODE_READ_ONLY' ? 403
+      : out.error === 'TIMEOUT' ? 408
+      : out.error === 'RESOURCE_EXHAUSTED' ? 429
+      : out.error === 'GATE_DISABLED' ? 503
       : 400;
     return fail(res, status, out.error, out.message || out.error);
   }
@@ -1430,18 +1408,18 @@ function serveSkill(res) {
 // ---------------------------------------------------------------------------
 function runMcpServer() {
   const readline = require('node:readline');
-  console.error('[mcp] muse-ai-local-bridge 0.2.0 (stdio MCP mode)');
+  console.error('[mcp] muse-ai-local-bridge 0.3.0 (stdio MCP mode)');
   console.error(`[mcp] roots: ${getRoots().map((r) => r.path).join(', ')} mode=${opts.readOnly ? 'read-only' : 'read-write'} shell=${SHELL_ENABLED} git_write=${GIT_WRITE_ENABLED}`);
   const rl = readline.createInterface({ input: process.stdin, terminal: false });
   function sendRpc(obj) { process.stdout.write(JSON.stringify(obj) + '\n'); }
-  rl.on('line', (line) => {
+  rl.on('line', async (line) => {
     if (!line.trim()) return;
     let msg; try { msg = JSON.parse(line); } catch { sendRpc({ jsonrpc: '2.0', id: null, error: { code: -32700, message: 'parse error' } }); return; }
     const id = msg.id;
     const isNotification = id === undefined || id === null;
     if (msg.method === 'notifications/initialized' || (typeof msg.method === 'string' && msg.method.startsWith('notifications/'))) return;
     if (msg.method === 'initialize') {
-      return sendRpc({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'muse-ai-local-bridge', version: '0.2.0' } } });
+      return sendRpc({ jsonrpc: '2.0', id, result: { protocolVersion: '2024-11-05', capabilities: { tools: {} }, serverInfo: { name: 'muse-ai-local-bridge', version: '0.3.0' } } });
     }
     if (msg.method === 'ping') return sendRpc({ jsonrpc: '2.0', id, result: {} });
     if (msg.method === 'tools/list') {
@@ -1450,7 +1428,7 @@ function runMcpServer() {
     if (msg.method === 'tools/call') {
       const name = msg.params && msg.params.name;
       const args = (msg.params && msg.params.arguments) || {};
-      const out = dispatchTool(name, args);
+      const out = await dispatchTool(name, args);
       if (out.error) return sendRpc({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify({ ok: false, error: { code: out.error, message: out.message } }) }], isError: true } });
       return sendRpc({ jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: JSON.stringify(out.data) }] } });
     }
@@ -1513,7 +1491,7 @@ const server = http.createServer(async (req, res) => {
       '  /api/tools/call?tool=<name>&<param>=<value>...\n' +
       'Example:\n' +
       '  /api/tools/call?tool=read_file&path=package.json\n\n' +
-      'Humans: https://github.com/tegarp00/muse-ai-local-bridge\n',
+      'Humans: https://github.com/fahmi0812/muse-ai-local-bridge\n',
       'text/plain; charset=utf-8');
   }
   if (url.pathname === '/skill.md') return serveSkill(res);
@@ -1541,21 +1519,23 @@ const server = http.createServer(async (req, res) => {
 if (opts.mcp) { runMcpServer(); } else server.listen(opts.port, '127.0.0.1', () => {
   const addr = server.address();
   const port = typeof addr === 'object' ? addr.port : opts.port;
-  console.log('');
-  console.log('muse-ai-local-bridge server running (V2 fork 0.2.0)');
-  console.log(`  roots: ${getRoots().map(r => r.path).join(', ')}`);
-  console.log(`  mode : ${opts.readOnly ? 'read-only' : 'read-write (read + write + commands)'}`);
-  console.log(`  local: http://127.0.0.1:${port}`);
-  console.log('');
-  console.log('  TOKEN (keep it secret, never paste into chat):');
-  console.log(`  ${TOKEN}`);
-  console.log(TOKEN_FRESH
+  console.error('');
+  console.error('muse-ai-local-bridge server running (V3 fork 0.3.0)');
+  console.error(`  roots: ${getRoots().map(r => r.path).join(', ')}`);
+  console.error(`  mode : ${opts.readOnly ? 'read-only' : 'read-write (read + write + commands)'}`);
+  console.error(`  local: http://127.0.0.1:${port}`);
+  // Token goes to stderr ONLY (v3): stdout is for MCP JSON-RPC and must
+  // never carry a secret; systemd/tmux logs also capture stdout.
+  console.error('');
+  console.error('  TOKEN (keep it secret, never paste into chat):');
+  console.error(`  ${TOKEN}`);
+  console.error(TOKEN_FRESH
     ? `  (saved to ${TOKEN_PATH} — reused on next start; use --new-token to rotate)`
     : `  (reused from ${TOKEN_PATH} — use --new-token to rotate)`);
-  console.log('');
-  console.log('  Next steps:');
-  console.log(`  1. Publish localhost with your tunnel, e.g.: cloudflared tunnel --url http://127.0.0.1:${port}`);
-  console.log('  2. In chat, paste:  connect to my local bridge at <your-tunnel-url>');
-  console.log('  3. Enter the token above in the connection card when asked.');
-  console.log('');
+  console.error('');
+  console.error('  Next steps:');
+  console.error(`  1. Publish localhost with your tunnel, e.g.: cloudflared tunnel --url http://127.0.0.1:${port}`);
+  console.error('  2. In chat, paste:  connect to my local bridge at <your-tunnel-url>');
+  console.error('  3. Enter the token above in the connection card when asked.');
+  console.error('');
 });

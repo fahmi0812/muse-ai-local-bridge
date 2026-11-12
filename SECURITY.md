@@ -16,8 +16,22 @@ doesn't. Read it before exposing a server.
   reach it through *your* tunnel.
 - **Scoped root.** The working directory (or each configured root) is the
   boundary. `..` traversal and symlinks escaping the root are rejected.
-- **Secret blocklist.** `.env*`, `*.key`, `*.pem`, `.ssh/`, `.aws/`, `.gnupg/`
-  and friends can never be read, listed, searched, or written — even inside the root.
+- **Secret blocklist.** `.env*`, `*.key`, `*.pem`, `.ssh/`, `.aws/`, `.gnupg/`,
+  `.npmrc`, `.git-credentials`, `credentials.json`, `*.token`,
+  `.docker/config.json`, `.netrc` and friends can never be read, listed,
+  searched, or written — even inside the root. (v3: extended list; it is
+  enforced by the central Gate, including `git_commit all:true`.)
+- **One central Gate, fail-closed.** Every git ref/argv, path list,
+  regex and file size goes through `lib/gate.js`. If the Gate is
+  disabled, all write/shell/git tools refuse with `GATE_DISABLED`.
+- **Bounded processes.** At most 8 terminals / 16 jobs (env-overridable);
+  finished ones are evicted, idle terminals killed after 30 min, kills
+  are process-group kills — a killed job cannot leave orphan processes.
+- **Audit log with rotation.** Rotates at 10 MB (keep 3); a write failure
+  is reported on stderr and marks the audit degraded instead of failing
+  silently. Terminal input is never logged (only id + byte count).
+- **Token to stderr only.** The startup token is printed to stderr, never
+  stdout, so it cannot land in MCP output or stdout logs.
 - **No shell, ever.** Git helpers and `run_command` use argv arrays. There is no
   shell to inject into.
 - **Allowlist, exact match.** `run_command` first rejects shell metacharacters,
@@ -95,3 +109,27 @@ honest trade-off:
 - **Terminal buffers are capped** at 512 KB per terminal / job (oldest
   output drops); `exec`/`terminal` output is never written to the audit
   log. Long-running terminals are not auto-killed — kill them when done.
+
+## V3 notes — what changed vs v2 (see PROTOCOL.md §11)
+
+- `git_commit all:true` no longer runs a raw `git add -A`: it enumerates
+  stageable files and skips blocklisted ones, so a `.env` in the repo
+  can never be committed by that path (RC2).
+- `git_push` / `git_checkout` reject refs starting with `-` and put
+  positional args after `--` (RC1). `git checkout` itself takes no `--`
+  (a branch is a revision, not a pathspec); its safety comes from the
+  ref validation.
+- `grep_code` patterns are capped at 200 chars, nested-quantifier
+  patterns are rejected, and matching runs in a worker thread with a
+  2 s timeout (RC5). A pathological-but-legal regex returns `TIMEOUT`
+  instead of hanging the server.
+- `search_code` on a single file checks the 1 MB cap before reading
+  (RC6); the walk path already skipped oversized files.
+- Terminals/jobs are bounded (8/16) with LRU eviction, idle TTL and
+  process-group kill (RC3/RC4). A busy server answers
+  `RESOURCE_EXHAUSTED` (429) instead of forking without limit.
+- The audit log rotates (10 MB, keep 3) and fails loud; terminal input
+  is never logged.
+- The token is printed to stderr only at startup.
+- PTY, sandbox (`bwrap`) and streaming are explicitly deferred in v3 —
+  see README "V3 — deferred (P2)".

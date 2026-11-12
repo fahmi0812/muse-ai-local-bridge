@@ -1,13 +1,15 @@
-# muse-ai-local-bridge — V2 fork
+# muse-ai-local-bridge — V3 fork
 
-> **Fork note:** this is an unofficial fork (v0.2.0) of
+> **Fork note:** this is an unofficial fork (v0.3.0) of
 > [tegarp00/muse-ai-local-bridge](https://github.com/tegarp00/muse-ai-local-bridge)
 > (MIT, v0.1.0). The original MIT license is unchanged (`LICENSE`).
 > V1 behaviour is preserved — every V1 tool works exactly as before.
 > V2 only *adds*: persistent terminals, async exec, opt-in full shell,
 > full git write, glob/regex search, a local skill loader, and a stdio
-> MCP mode. See [PROTOCOL.md §10](PROTOCOL.md) and [SECURITY.md](SECURITY.md)
-> before enabling the shell.
+> MCP mode. V3 only *hardens and speeds up*: a central fail-closed Gate,
+> bounded processes with group kill, 1-spawn git, worker-thread search,
+> rotating audit log. See [PROTOCOL.md §11](PROTOCOL.md) and
+> [SECURITY.md](SECURITY.md) before enabling the shell.
 
 Give Muse AI scoped access to a local project folder — over a plain GET tool API.
 
@@ -136,10 +138,65 @@ process only). Add it as a local MCP server in OpenCode
 `command: ["node", "<path>/server.js", "--mcp", "--allow-shell"]`).
 It exposes exactly the tools the flags allow. Details: [PROTOCOL.md §10.6](PROTOCOL.md).
 
+## V3 — hardened + faster (opt-in changes: none — same flags, same tools)
+
+V3 keeps all 27 tool names and response shapes, and fixes the six root
+causes from the v3 full critique (`FULLCRITIC-v3.md`):
+
+- **One Gate, fail-closed** (`lib/gate.js`): git refs can no longer
+  start with `-` (no `--force` injection via `git_push`/`git_checkout`),
+  `git_commit all:true` enumerates files and filters secrets instead of
+  a raw `git add -A`, regexes are length-capped + nested-quantifier
+  checked and run in a worker thread with a 2 s timeout, single-file
+  search is size-checked before reading. Disable the Gate and every
+  write/shell/git tool refuses (`GATE_DISABLED`).
+- **Bounded processes** (`lib/process-manager.js`): max 8 terminals /
+  16 jobs (env-overridable), LRU eviction, idle TTL, process-group kill
+  — no orphaned `sleep`/`build` processes after a kill or timeout.
+- **Faster git + reads** (`lib/git-service.js`, `lib/fs-service.js`):
+  `git_status`/`git_branch` are 1 spawn per call, `list_files` uses a
+  2 s walk cache (invalidated on write), `read_file` uses a range read,
+  search/grep run in a warm worker thread.
+- **Honest audit** (`lib/audit.js`): rotates at 10 MB (keep 3), fails
+  loud instead of swallowing errors, never logs terminal input.
+- **Token to stderr only** at startup; extended secret blocklist
+  (`.npmrc`, `.git-credentials`, `credentials.json`, `*.token`,
+  `.docker/config.json`, `.netrc`); `read_file` offset documented as
+  0-based (the code was always 0-based).
+
+Benchmarks: `node test/bench.mjs` (thresholds recalibrated 12 Nov 2026
+in `test/bench.mjs` header — the original DESIGN-v3 §5 absolutes
+<6 ms / <15 ms / <3 ms proved unrealistic on this VM and were revised
+with measured reasons, not forced). On the sandbox VM the big wins are
+`list_files` on a large tree (~10 ms → ~2 ms cache-hit), search/grep
+via a warm worker with a `Buffer.includes` prefilter, and the search no
+longer blocking the event loop; git/search/read latencies sit at the
+raw-cost floor of this VM (spawn ~3 ms, git status on a committed
+803-file tree ~6–56 ms raw, stat+read of 803 files ~20 ms under
+contention), so the recalibrated thresholds are VM guardrails, not
+latency claims — see `CHANGELOG.md` for the measured numbers.
+
+### V3 — deferred (P2, explicitly NOT implemented)
+
+- **PTY** (`node-pty`): would break zero-deps (native module, per-platform
+  build) for interactive programs only a minority needs; the non-PTY
+  terminal already covers scripts, builds and tests.
+- **Sandbox (`bwrap`)**: Linux-only, needs `bwrap` installed, and would
+  change the shell's reach in ways that break legitimate project-local
+  workflows; the documented trade-off (shell can read the root) stays
+  honest instead.
+- **Streaming (SSE/NDJSON)**: a new transport on top of polling, with no
+  measured need — polling costs ~1 ms per round-trip locally, and tunnel
+  latency dominates in real use anyway.
+
+All three stay out of the default path on purpose: v3's promise is
+"same tools, safer, faster" — not a new runtime.
+
 ### Tests
 
 ```sh
-npm test   # node:test, stdlib only — 10 tests, spawns real servers on temp projects
+npm test   # node:test, stdlib only — 33 tests (10 v2 + 23 v3), spawns real servers on temp projects
+node test/bench.mjs   # benchmark harness (in-repo): git/search/list_files/read_file/terminal/exec/MCP vs thresholds
 ```
 
 ## Multiple projects

@@ -149,7 +149,9 @@ Error codes (V1): `MISSING_TOKEN`, `INVALID_TOKEN`, `UNKNOWN_TOOL`,
    Anything else → `PATH_OUTSIDE_ROOT`.
 2. The permanent blocklist is enforced even inside allowed roots:
    `.env` and variants (except `.env.example` / `.env.sample`),
-   `*.key`, `*.pem`, `.ssh/`, `.aws/`, `.gnupg/`. Match → `FILE_BLOCKED`.
+   `*.key`, `*.pem`, `.ssh/`, `.aws/`, `.gnupg/`, `.npmrc`,
+   `.git-credentials`, `credentials.json`, `*.token`, `.docker/config.json`,
+   `.netrc`. Match → `FILE_BLOCKED`. (v3: extended list, see §11.)
 3. `list_files` and `search_code` SHOULD respect `.gitignore` by default.
    `read_file` with an explicit path bypasses `.gitignore` (explicit
    path = owner intent) but never the blocklist.
@@ -164,7 +166,7 @@ Tool names are **frozen** as of V1 — clients depend on them.
 |---|---|---|
 | `list_projects` | — | Returns allowed roots (one entry in cwd mode, several in config mode). |
 | `list_files` | `path` (dir, default root), `recursive` (bool, default true) | Respects `.gitignore`. |
-| `read_file` | `path`, `offset` (1-based, optional), `limit` (optional) | Text files returned as UTF-8. |
+| `read_file` | `path`, `offset` (0-based, optional), `limit` (optional) | Text files returned as UTF-8. Offset is **0-based** (v3 correction: the code was always 0-based; the doc wrongly said 1-based). |
 | `search_code` | `pattern`, `path` (optional), `file_glob` (optional) | Literal match; respects `.gitignore`. |
 | `git_status` | `project` (optional) | Per-file porcelain-style entries. |
 | `git_diff` | `project` (optional), `staged` (bool) | Unified diff. |
@@ -223,7 +225,7 @@ to `~/.muse-ai-local-bridge/audit.log`:
 ## 10. V2 (fork, additive — V1 tools and endpoints are unchanged)
 
 V2 keeps every V1 tool, endpoint and error code, and adds the tools below.
-`/api/tools/list` now also returns `version: "0.2.0"`, `shell_enabled`
+`/api/tools/list` now also returns `version: "0.3.0"`, `shell_enabled`
 and `git_write_enabled`, so a client can tell at a glance what is on.
 
 ### 10.1 Persistent terminals (requires `--allow-shell`)
@@ -271,7 +273,7 @@ and rotate the token if it may have leaked. See `SECURITY.md` §V2.
 | Tool | Args | Notes |
 |---|---|---|
 | `git_branch` | `project` | Read tool, always available. Lists branches + current branch. |
-| `git_commit` | `message` (≤500 chars), `all` (bool), `files` (array) | `all:true` runs `git add -A` first; `files` stages exactly those paths (each resolved in-root, blocklist-checked). |
+| `git_commit` | `message` (≤500 chars), `all` (bool), `files` (array) | `all:true` enumerates stageable files (`git ls-files`, tracked + untracked respecting `.gitignore`), filters each through the same Gate blocklist as `files`, then runs `git add -- <filtered>` (v3, RC2 — never a raw `git add -A`); `files` stages exactly those paths (each resolved in-root, blocklist-checked). |
 | `git_push` | `remote` (default `origin`), `branch` | Remote/branch names are validated (`[A-Za-z0-9._/-]+`); argv spawn, no shell. |
 | `git_checkout` | `branch`, `create` (bool) | `create:true` = `checkout -b`. |
 
@@ -311,3 +313,49 @@ Example (OpenCode `opencode.json`):
 
 `SHELL_NOT_ENABLED`, `GIT_WRITE_NOT_ALLOWED`, `TERMINAL_CLOSED`.
 All other V1 codes are unchanged.
+
+## 11. V3 (fork, additive — V1/V2 tools and endpoints are unchanged)
+
+`/api/tools/list` now returns `version: "0.3.0"`. Tool names, response
+shapes and error envelopes are unchanged. What changed is under the hood:
+
+- **Central Gate (`lib/gate.js`, fail-closed).** One module validates
+  every git ref/argv (`validateRef` rejects leading `-`, `validateArgv`
+  inserts `--` before positional args and rejects user flags), every
+  path list (blocklist + root scope), every regex (max 200 chars, nested
+  quantifiers rejected) and every file size (1 MB, checked *before* any
+  read). If the Gate is disabled, all write/shell/git tools refuse with
+  `GATE_DISABLED` — there is no path that runs without it.
+- **Bounded processes (`lib/process-manager.js`).** Max 8 terminals /
+  16 jobs (env `MUSE_BRIDGE_MAX_TERMINALS` / `MUSE_BRIDGE_MAX_JOBS`);
+  finished ones are evicted LRU, idle terminals are killed after
+  30 min, finished jobs are dropped after 10 min; a full manager
+  refuses with `RESOURCE_EXHAUSTED` instead of forking more. Kills are
+  process-group kills (`detached:true` + `kill(-pid, SIGKILL)`), so no
+  orphaned grandchildren survive `terminal_kill` / `exec_kill` / timeout.
+- **Git, 1 spawn per call (`lib/git-service.js`).** `git_status` is a
+  single `git status --porcelain=v1 -b`; `git_branch` is a single
+  `git branch` plus the current branch read from `.git/HEAD` (cached
+  1 s, invalidated by mtime). `git_push` / `git_checkout` refs go
+  through the Gate (RC1).
+- **Search in a worker thread (`lib/search.js`).** `grep_code` /
+  `search_code` (directory mode) match inside a `worker_threads`
+  worker with a 2 s timeout — a ReDoS pattern returns `TIMEOUT`
+  instead of hanging the server; a dead worker is a rejected call,
+  never a hang.
+- **Audit log (`lib/audit.js`).** Rotates at 10 MB (keep 3), fails loud
+  (write failure → stderr + degraded flag, never a silent `catch {}`),
+  and never logs terminal input (only the terminal id + byte count).
+- **Token.** Printed to stderr only at startup, never to stdout (stdout
+  is the MCP channel and must never carry a secret).
+- **`read_file` offset is 0-based** (§6, corrected to match the code —
+  the code itself did not change, so old clients are unaffected).
+- **New error codes (V3):** `GATE_DISABLED` (503), `RESOURCE_EXHAUSTED`
+  (429), `TIMEOUT` (408). All V1/V2 codes are unchanged.
+
+### 11.1 Explicitly deferred (not in v3)
+
+PTY support, sandboxing (`bwrap`) and streaming (SSE/NDJSON) are
+**DEFERRED** — see README "V3 — deferred (P2)" for the reasons. They
+need an optional native dependency / Linux-only tooling / a new
+transport, and none of them may break the zero-dependency default.
